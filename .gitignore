@@ -1,0 +1,31 @@
+# Private personal photos & raw generation assets (NEVER commit!)
+人物照片/
+assets/raw/
+assets/raw_v5/
+assets/sprites/
+
+# Legacy BongoCat prototype files & local machine shortcuts
+BongoCat皮肤包/
+启动BongoCat.bat
+启动陪伴桌宠.bat
+启动陪伴桌宠.vbs
+*.lnk
+src/build_bongocat_skins.py
+src/build_sprites.py
+src/install_skins_to_bongocat.py
+
+# Local runtime state & logs
+config.json
+error.log
+
+# Python & PyInstaller build artifacts
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+Thumbs.db
