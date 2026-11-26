@@ -16,7 +16,7 @@ Features:
 from __future__ import annotations
 
 APP_NAME = "开开陪玩"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 WINDOW_CLASS_NAME = "KaikaiPeiwanPetWindow"
 LEGACY_WINDOW_CLASS_NAME = "ChibiTypingCompanionPetWindowV5"
 
@@ -142,6 +142,7 @@ CMD_CLICK_THROUGH = 1004
 CMD_TOGGLE_HUD = 1005
 CMD_TOGGLE_TOPMOST = 1006
 CMD_TOGGLE_KEYCAPS = 1007
+CMD_TOGGLE_INTERACT = 1009
 CMD_SCALE_70 = 1010
 CMD_SCALE_100 = 1011
 CMD_SCALE_130 = 1012
@@ -598,7 +599,14 @@ MOOD_LABELS = {
     "happy": "开心轻敲中",
     "focused": "认真专注中",
     "frantic": "暴走狂敲中!!",
+    "doze": "打瞌睡中 Zzz",
+    "headpat": "摸摸头好开心~",
 }
+
+HEADPAT_PHRASES = ("嘿嘿好舒服~", "再摸摸嘛~", "蹭蹭你~", "好开心呀~")
+POKE_MILD_PHRASES = ("干嘛戳我呀~", "脸要被戳扁啦!", "嗯？找我玩嘛~", "好痒呀~")
+POKE_SHY_PHRASES = ("呀别戳啦 >_<", "投降啦投降啦!", "脸都红啦 >_<")
+WELCOME_PHRASES = ("回来啦~", "等你半天啦!", "继续一起加油~")
 
 # Typing speed (keys/sec) thresholds for expression shifts:
 # (happy_up, focused_up, frantic_up, happy_down, focused_down, frantic_down)
@@ -691,8 +699,8 @@ class V5OutfitPack:
 # ---------------------------------------------------------------------------
 class ChibiDesktopPet:
     BASE_DISPLAY_PX = 310
-    CANVAS_PAD_X = 28
-    CANVAS_PAD_TOP = 20
+    CANVAS_PAD_X = 44
+    CANVAS_PAD_TOP = 64     # generous headroom for floating hearts, Zzz, and cute speech bubbles
     CANVAS_PAD_BOTTOM = 54  # crisp room for floating mechanical keycap pills + hover HUD
 
     def __init__(self, resource_root: Path, data_root: Optional[Path] = None) -> None:
@@ -723,11 +731,54 @@ class ChibiDesktopPet:
         self.hicon: Optional[int] = None
         self._wndproc_ref: Optional[WNDPROC] = None
 
-        # Interaction state
+        # Interaction & drag state
+        self._lbtn_down = False
+        self._down_screen = (0, 0)
+        self._down_local = (0, 0)
         self.dragging = False
         self.drag_offset = (0, 0)
+        self._drag_sway = 0.0
+        self._last_drag_x = 0
+        self.land_pop_until = 0.0
         self.hovering = False
         self.click_through = False
+
+        # Last drawn sprite rect in canvas coordinates (used for headpat / cheek-poke hit-testing)
+        self._sprite_rect = (0, 0, 300, 340)
+
+        # Headpat state
+        self._last_pat_pos: Optional[Tuple[int, int]] = None
+        self._last_pat_move_at = 0.0
+        self._pat_travel = 0.0
+        self._pat_dir = 0
+        self._pat_reversals = 0
+        self.headpat_until = 0.0
+        self._headpat_started_at = 0.0
+        self._next_heart_at = 0.0
+        self._last_pat_bubble_at = 0.0
+
+        # Cheek poke state
+        self._pending_poke_at = 0.0
+        self._pending_poke_pos = (0, 0)
+        self.poke_combo = 0
+        self.last_poke_time = 0.0
+        self.poke_shake_until = 0.0
+
+        # Intimate reaction expression / speech bubble / particles
+        self.interact_expr: Optional[str] = None
+        self.interact_expr_until = 0.0
+        self.bubble_text: str = ""
+        self.bubble_start_at = 0.0
+        self.bubble_until = 0.0
+        self.particles: List[dict] = []
+
+        # Idle doze (Zzz) & welcome back state
+        now_init = time.perf_counter()
+        self.last_activity_at = now_init
+        self._last_cursor_screen: Optional[Tuple[int, int]] = None
+        self.is_dozing = False
+        self._next_zzz_at = 0.0
+        self.welcome_hop_until = 0.0
 
         # Smoothed normalized cursor position [0..1]
         self.smooth_mx = 0.45
@@ -736,22 +787,26 @@ class ChibiDesktopPet:
         # Expression & animation state
         self.current_mood = "idle"
         self.smooth_kps = 0.0
-        self.mood_entered_at = time.perf_counter()
-        self.next_blink_at = time.perf_counter() + random.uniform(2.5, 4.8)
+        self.mood_entered_at = now_init
+        self.next_blink_at = now_init + random.uniform(2.5, 4.8)
         self.blink_until = 0.0
         self.outfit_pop_until = 0.0
-        self.start_time = time.perf_counter()
+        self.start_time = now_init
 
         # Optional override state for live automated verification screenshots
         self._verify_override: Optional[dict] = None
 
-        self._hud_font = self._load_font(int(round(12 * self._dpi_factor())), bold=False)
-        self._key_font = self._load_font(int(round(13 * self._dpi_factor())), bold=True)
+        dpi = self._dpi_factor()
+        self._hud_font = self._load_font(int(round(12 * dpi)), bold=False)
+        self._key_font = self._load_font(int(round(13 * dpi)), bold=True)
+        self._bubble_font = self._load_font(int(round(12.5 * dpi)), bold=True)
+        self._zzz_font_lg = self._load_font(int(round(16 * dpi)), bold=True)
+        self._zzz_font_sm = self._load_font(int(round(12 * dpi)), bold=True)
 
         self.win_x = int(self.config["x"])
         self.win_y = int(self.config["y"])
-        self.canvas_w = 366
-        self.canvas_h = 384
+        self.canvas_w = 398
+        self.canvas_h = 428
         self._recompute_canvas_size()
 
     def _load_config(self) -> dict:
@@ -761,12 +816,14 @@ class ChibiDesktopPet:
         defaults = {
             "outfit": "bear",
             "scale": 1.0,
-            "x": max(20, sw - int(round(390 * dpi))),
-            "y": max(20, sh - int(round(445 * dpi))),
+            "x": max(20, sw - int(round(410 * dpi))),
+            "y": max(20, sh - int(round(490 * dpi))),
             "show_hud": True,
             "show_keycaps": True,
             "always_on_top": True,
             "mood_sensitivity": "normal",
+            "enable_interactions": True,
+            "idle_sleep_seconds": 300,
         }
         if self.config_path.exists():
             try:
@@ -839,9 +896,18 @@ class ChibiDesktopPet:
         self.canvas_w = sample.width + int(round(self.CANVAS_PAD_X * 2 * dpi))
         self.canvas_h = sample.height + int(round((self.CANVAS_PAD_TOP + self.CANVAS_PAD_BOTTOM) * dpi))
 
-    def _poll_mouse_pose(self) -> str:
+    def _poll_mouse_pose(self, now: Optional[float] = None) -> str:
         pt = POINT()
         user32.GetCursorPos(ctypes.byref(pt))
+        if now is not None:
+            if self._last_cursor_screen is None:
+                self._last_cursor_screen = (pt.x, pt.y)
+            else:
+                dx = pt.x - self._last_cursor_screen[0]
+                dy = pt.y - self._last_cursor_screen[1]
+                if (dx * dx + dy * dy) >= 225:  # moved >= 15px
+                    self._last_cursor_screen = (pt.x, pt.y)
+                    self._note_user_activity(now)
         vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
         vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
         vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN) or user32.GetSystemMetrics(SM_CXSCREEN) or 1920
@@ -856,6 +922,370 @@ class ChibiDesktopPet:
         if self.smooth_my < 0.48:
             return "ul" if self.smooth_mx < 0.50 else "ur"
         return "center" if self.smooth_mx < 0.54 else "dr"
+
+    # -----------------------------------------------------------------------
+    # Intimate Micro-Interactions: Headpat, Cheek Poke, Idle Doze & Welcome Back
+    # -----------------------------------------------------------------------
+    def _interactions_enabled(self) -> bool:
+        return bool(self.config.get("enable_interactions", True))
+
+    def _show_bubble(self, text: str, now: float, duration: float = 2.2) -> None:
+        self.bubble_text = text
+        self.bubble_start_at = now
+        self.bubble_until = now + duration
+
+    def _spawn_particle(
+        self,
+        kind: str,
+        x: float,
+        y: float,
+        now: float,
+        vx: float = 0.0,
+        vy: float = -34.0,
+        life: float = 1.35,
+        size: float = 10.0,
+        color: Tuple[int, int, int] = (255, 118, 152),
+        text: str = "",
+    ) -> None:
+        if len(self.particles) >= 24:
+            self.particles.pop(0)
+        self.particles.append({
+            "kind": kind,
+            "x": float(x),
+            "y": float(y),
+            "vx": float(vx),
+            "vy": float(vy),
+            "born": now,
+            "life": float(life),
+            "size": float(size),
+            "color": color,
+            "phase": random.uniform(0.0, math.tau),
+            "text": text,
+        })
+
+    def _note_user_activity(self, now: float) -> None:
+        was_dozing = self.is_dozing
+        self.last_activity_at = now
+        if was_dozing:
+            self.is_dozing = False
+            if self._interactions_enabled():
+                self._trigger_welcome_back(now)
+
+    def _trigger_welcome_back(self, now: float) -> None:
+        dpi = self._dpi_factor()
+        self.interact_expr = "happy"
+        self.interact_expr_until = now + 2.35
+        self.welcome_hop_until = now + 0.34
+        self._show_bubble(random.choice(WELCOME_PHRASES), now, duration=2.4)
+        sx, sy, sw, sh = self._sprite_rect
+        cx = sx + sw * 0.5
+        cy = sy + sh * 0.22
+        colors = [(255, 204, 78), (255, 134, 168), (126, 206, 255), (196, 150, 255)]
+        for i in range(5):
+            ang = -math.pi * 0.85 + i * (math.pi * 0.70 / 4.0)
+            spd = random.uniform(30.0, 52.0) * dpi
+            self._spawn_particle(
+                "sparkle",
+                cx + math.cos(ang) * sw * 0.22,
+                cy + math.sin(ang) * sh * 0.08,
+                now,
+                vx=math.cos(ang) * spd * 0.65,
+                vy=math.sin(ang) * spd - 14.0 * dpi,
+                life=1.05,
+                size=random.uniform(7.5, 10.5) * dpi,
+                color=colors[i % len(colors)],
+            )
+        self._spawn_particle(
+            "heart",
+            cx + sw * 0.16,
+            cy - 4.0 * dpi,
+            now,
+            vx=8.0 * dpi,
+            vy=-34.0 * dpi,
+            life=1.4,
+            size=9.5 * dpi,
+            color=(255, 118, 152),
+        )
+
+    def _handle_headpat_move(self, local_x: int, local_y: int, now: float) -> None:
+        if not self._interactions_enabled() or self.dragging:
+            self._last_pat_pos = None
+            return
+        sx, sy, sw, sh = self._sprite_rect
+        if sw <= 10 or sh <= 10:
+            return
+        rx = (local_x - sx) / float(sw)
+        ry = (local_y - sy) / float(sh)
+        in_head = (0.14 <= rx <= 0.86) and (-0.02 <= ry <= 0.37)
+        if not in_head:
+            self._last_pat_pos = None
+            return
+
+        dpi = self._dpi_factor()
+        if self._last_pat_pos is None or (now - self._last_pat_move_at) > 0.65:
+            self._last_pat_pos = (local_x, local_y)
+            self._last_pat_move_at = now
+            self._pat_travel = 0.0
+            self._pat_dir = 0
+            self._pat_reversals = 0
+            return
+
+        dx = local_x - self._last_pat_pos[0]
+        dy = local_y - self._last_pat_pos[1]
+        self._last_pat_pos = (local_x, local_y)
+        self._last_pat_move_at = now
+
+        if abs(dx) >= 2 and abs(dx) >= abs(dy) * 0.55:
+            d = 1 if dx > 0 else -1
+            if self._pat_dir != 0 and d != self._pat_dir:
+                self._pat_reversals += 1
+            self._pat_dir = d
+            self._pat_travel += abs(dx)
+
+        # Require gentle rubbing (back-and-forth or sustained horizontal scrub) so stray mouse passes never misfire
+        triggered = (self._pat_travel >= 68.0 * dpi) or (self._pat_reversals >= 1 and self._pat_travel >= 38.0 * dpi)
+        if triggered:
+            self._note_user_activity(now)
+            was_patting = now < self.headpat_until
+            if not was_patting:
+                self._headpat_started_at = now
+            self.headpat_until = now + 1.05
+            self._pat_travel *= 0.35
+            if now >= self._next_heart_at:
+                self._next_heart_at = now + 0.27
+                self._spawn_particle(
+                    "heart",
+                    local_x + random.uniform(-16.0, 16.0) * dpi,
+                    sy + sh * 0.10 + random.uniform(-6.0, 6.0) * dpi,
+                    now,
+                    vx=random.uniform(-14.0, 14.0) * dpi,
+                    vy=random.uniform(-42.0, -28.0) * dpi,
+                    life=1.35,
+                    size=random.uniform(8.5, 11.5) * dpi,
+                    color=random.choice([(255, 112, 148), (255, 142, 174), (255, 96, 128)]),
+                )
+            if not was_patting and (now - self._last_pat_bubble_at) >= 2.2:
+                self._last_pat_bubble_at = now
+                self._show_bubble(random.choice(HEADPAT_PHRASES), now, duration=2.0)
+
+    def _trigger_cheek_poke(self, now: float, local_x: int, local_y: int) -> None:
+        if not self._interactions_enabled():
+            return
+        self._note_user_activity(now)
+        dpi = self._dpi_factor()
+        if (now - self.last_poke_time) <= 4.5:
+            self.poke_combo += 1
+        else:
+            self.poke_combo = 1
+        self.last_poke_time = now
+
+        if self.poke_combo >= 3:
+            self.interact_expr = "frantic"
+            self.interact_expr_until = now + 1.85
+            self.poke_shake_until = now + 0.52
+            self._show_bubble(random.choice(POKE_SHY_PHRASES), now, duration=2.1)
+            count = 5
+            cols = [(255, 122, 132), (255, 206, 86), (120, 198, 255)]
+        else:
+            self.interact_expr = "focused"
+            self.interact_expr_until = now + 1.45
+            self.poke_shake_until = now + 0.34
+            self._show_bubble(random.choice(POKE_MILD_PHRASES), now, duration=1.9)
+            count = 3
+            cols = [(255, 204, 86), (255, 148, 168), (255, 224, 130)]
+
+        for i in range(count):
+            ang = random.uniform(0.0, math.tau)
+            spd = random.uniform(22.0, 44.0) * dpi
+            self._spawn_particle(
+                "sparkle",
+                local_x + math.cos(ang) * 6.0 * dpi,
+                local_y + math.sin(ang) * 6.0 * dpi,
+                now,
+                vx=math.cos(ang) * spd,
+                vy=math.sin(ang) * spd - 12.0 * dpi,
+                life=0.85,
+                size=random.uniform(6.5, 9.5) * dpi,
+                color=cols[i % len(cols)],
+            )
+
+    def _draw_heart_shape(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cx: float,
+        cy: float,
+        size: float,
+        color: Tuple[int, int, int],
+        alpha: int,
+    ) -> None:
+        pts = []
+        s = size / 16.0
+        for i in range(20):
+            th = (math.tau * i) / 20.0
+            hx = 16.0 * (math.sin(th) ** 3)
+            hy = -(13.0 * math.cos(th) - 5.0 * math.cos(2 * th) - 2.0 * math.cos(3 * th) - math.cos(4 * th))
+            pts.append((cx + hx * s, cy + hy * s))
+        outline_col = (max(0, color[0] - 48), max(0, color[1] - 48), max(0, color[2] - 42), min(255, int(alpha * 0.95)))
+        draw.polygon(pts, fill=(color[0], color[1], color[2], alpha), outline=outline_col)
+        # Tiny glossy highlight dot on upper-left lobe
+        hr = max(1.2, size * 0.14)
+        hx0, hy0 = cx - size * 0.30, cy - size * 0.24
+        draw.ellipse((hx0 - hr, hy0 - hr, hx0 + hr, hy0 + hr), fill=(255, 255, 255, int(alpha * 0.85)))
+
+    def _draw_sparkle_shape(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cx: float,
+        cy: float,
+        size: float,
+        color: Tuple[int, int, int],
+        alpha: int,
+    ) -> None:
+        outer = size
+        inner = size * 0.34
+        pts = []
+        for i in range(8):
+            ang = i * (math.pi / 4.0)
+            r = outer if i % 2 == 0 else inner
+            pts.append((cx + math.cos(ang) * r, cy + math.sin(ang) * r))
+        draw.polygon(pts, fill=(color[0], color[1], color[2], alpha), outline=(255, 255, 255, int(alpha * 0.85)))
+
+    def _draw_particles(self, canvas: Image.Image, now: float, static_particles: Optional[List[dict]] = None) -> Image.Image:
+        items = static_particles if static_particles is not None else self.particles
+        if not items:
+            return canvas
+
+        dpi = self._dpi_factor()
+        layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        alive = []
+        for p in items:
+            age = p["static_age"] if "static_age" in p else (now - p["born"])
+            life = p["life"]
+            if age < 0 or age >= life:
+                continue
+            alive.append(p)
+            prog = age / life
+            # Smooth fade in quickly (first 15%), hold, fade out smoothly (last 40%)
+            if prog < 0.15:
+                fade = prog / 0.15
+            elif prog > 0.60:
+                fade = max(0.0, 1.0 - (prog - 0.60) / 0.40)
+            else:
+                fade = 1.0
+            alpha = int(round(245 * fade))
+            if alpha <= 4:
+                continue
+
+            sway = math.sin(age * 4.2 + p["phase"]) * (5.5 * dpi)
+            px = p["x"] + p["vx"] * age + sway
+            py = p["y"] + p["vy"] * age
+            kind = p["kind"]
+
+            if kind == "heart":
+                sc = 0.72 + 0.36 * min(1.0, prog / 0.25)
+                self._draw_heart_shape(draw, px, py, p["size"] * sc, p["color"], alpha)
+            elif kind == "sparkle":
+                sc = math.sin(min(1.0, prog) * math.pi)
+                self._draw_sparkle_shape(draw, px, py, max(2.5, p["size"] * sc), p["color"], alpha)
+            elif kind == "zzz":
+                txt = p.get("text") or "Z"
+                font = self._zzz_font_lg if txt == "Z" else self._zzz_font_sm
+                col = p["color"]
+                # Crisp white halo so pastel Zzz stays readable on dark AND light wallpapers
+                for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    draw.text((px + ox, py + oy), txt, font=font, fill=(255, 255, 255, int(alpha * 0.85)))
+                draw.text((px, py), txt, font=font, fill=(col[0], col[1], col[2], alpha))
+
+        if static_particles is None:
+            self.particles = alive
+        return Image.alpha_composite(canvas, layer)
+
+    def _draw_reaction_bubble(
+        self,
+        canvas: Image.Image,
+        pack: V5OutfitPack,
+        text: str,
+        age: float,
+        duration: float,
+    ) -> Image.Image:
+        if not text or age < 0 or age >= duration:
+            return canvas
+
+        dpi = self._dpi_factor()
+        if age < 0.14:
+            fade = age / 0.14
+            pop_y = int(round((1.0 - fade) * 7.0 * dpi))
+        elif (duration - age) < 0.35:
+            fade = max(0.0, (duration - age) / 0.35)
+            pop_y = 0
+        else:
+            fade = 1.0
+            pop_y = 0
+        if fade <= 0.04:
+            return canvas
+
+        layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        theme = pack.layout["theme"]
+        bg_c = theme["pill_bg_rgba"]
+        bd_c = theme["pill_border_rgba"]
+        tx_c = theme["pill_text_rgba"]
+
+        bbox = draw.textbbox((0, 0), text, font=self._bubble_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        pad_x = int(round(12 * dpi))
+        pad_y = int(round(6 * dpi))
+        bw = tw + pad_x * 2
+        bh = th + pad_y * 2
+        tail_h = int(round(7 * dpi))
+
+        bx1 = max(6, min(self.canvas_w - bw - 6, (self.canvas_w - bw) // 2))
+        sx, sy, sw, _ = self._sprite_rect
+        by1 = max(6, sy - bh - tail_h - int(round(4 * dpi)) + pop_y)
+
+        # Soft drop shadow
+        sh_a = int(52 * fade)
+        draw.rounded_rectangle(
+            (bx1 + 1, by1 + int(round(2 * dpi)), bx1 + bw + 1, by1 + bh + int(round(2 * dpi))),
+            radius=bh // 2,
+            fill=(40, 32, 48, sh_a),
+        )
+
+        fill_col = (bg_c[0], bg_c[1], bg_c[2], int(246 * fade))
+        border_col = (bd_c[0], bd_c[1], bd_c[2], int(235 * fade))
+        bw_line = max(1, int(round(1.5 * dpi)))
+
+        # Little speech pointer triangle at bottom center
+        tcx = self.canvas_w // 2
+        tail_w = int(round(6 * dpi))
+        tail_pts = [
+            (tcx - tail_w, by1 + bh - 2),
+            (tcx + tail_w, by1 + bh - 2),
+            (tcx, by1 + bh + tail_h),
+        ]
+        draw.polygon(tail_pts, fill=fill_col, outline=border_col)
+
+        # Rounded speech bubble body (drawn over top seam of pointer triangle)
+        draw.rounded_rectangle(
+            (bx1, by1, bx1 + bw, by1 + bh),
+            radius=bh // 2,
+            fill=fill_col,
+            outline=border_col,
+            width=bw_line,
+        )
+        # Cover inner border line above pointer so bubble + pointer look seamless
+        draw.line(
+            [(tcx - tail_w + 2, by1 + bh - 1), (tcx + tail_w - 2, by1 + bh - 1)],
+            fill=fill_col,
+            width=bw_line + 1,
+        )
+
+        tx = bx1 + (bw - tw) // 2 - bbox[0]
+        ty = by1 + (bh - th) // 2 - bbox[1] - 1
+        draw.text((tx, ty), text, font=self._bubble_font, fill=(tx_c[0], tx_c[1], tx_c[2], int(255 * fade)))
+        return Image.alpha_composite(canvas, layer)
 
     def _compute_mood(self, now: float, raw_kps: float, idle_secs: float) -> str:
         # Smooth KPS with EMA so isolated quick taps never cause twitchy expression flicker
@@ -1058,6 +1488,12 @@ class ChibiDesktopPet:
             cur_x += pw + gap
 
     def _render_frame(self, now: float) -> Image.Image:
+        dpi = self._dpi_factor()
+        static_particles: Optional[List[dict]] = None
+        ov_bubble: Optional[Tuple[str, float, float]] = None
+        is_headpat = False
+        is_dozing_now = False
+
         if self._verify_override is not None:
             ov = self._verify_override
             kps = ov.get("kps", 0.0)
@@ -1069,8 +1505,17 @@ class ChibiDesktopPet:
             mouse_click_alpha = ov.get("mouse_click_alpha", 0.0)
             hit_age = ov.get("hit_age", 9.9)
             show_hud_force = ov.get("show_hud", False)
-            mood_for_hud = expr
+            mood_for_hud = ov.get("mood_label", expr)
+            is_headpat = bool(ov.get("headpat", False))
+            is_dozing_now = bool(ov.get("dozing", False))
+            static_particles = ov.get("particles")
+            ov_bubble = ov.get("bubble")
         else:
+            # Fire deferred cheek poke if double-click did not arrive within 230ms
+            if self._pending_poke_at > 0.0 and now >= self._pending_poke_at:
+                self._pending_poke_at = 0.0
+                self._trigger_cheek_poke(now, self._pending_poke_pos[0], self._pending_poke_pos[1])
+
             snap = self.input_monitor.get_snapshot(now)
             kps = snap["kps"]
             kb_pose = snap["kb_pose"]
@@ -1078,23 +1523,68 @@ class ChibiDesktopPet:
             pills = snap["pills"]
             mouse_click_alpha = snap["mouse_click_alpha"]
             hit_age = snap["hit_age"]
+
+            if snap["idle_secs"] < 0.4:
+                self._note_user_activity(now)
+            mouse_pose = self._poll_mouse_pose(now)
             expr = self._compute_mood(now, kps, snap["idle_secs"])
-            mouse_pose = self._poll_mouse_pose()
             show_hud_force = False
             mood_for_hud = self.current_mood
 
+            # Idle doze check (default 300s of total inactivity)
+            sleep_secs = max(30.0, float(self.config.get("idle_sleep_seconds", 300)))
+            if self._interactions_enabled() and not self.dragging:
+                if (now - self.last_activity_at) >= sleep_secs:
+                    if not self.is_dozing:
+                        self.is_dozing = True
+                        self._next_zzz_at = now + 0.15
+                is_dozing_now = self.is_dozing
+
+            # Priority expression overrides: Headpat > Cheek Poke / Welcome Back > Idle Doze > Typing Mood
+            if now < self.headpat_until:
+                is_headpat = True
+                # Alternate peacefully between smiling blink and starry happy while being patted
+                pat_elap = now - self._headpat_started_at
+                expr = "blink" if (int(pat_elap / 0.70) % 2 == 0) else "happy"
+                mood_for_hud = "headpat"
+            elif self.interact_expr and now < self.interact_expr_until:
+                expr = self.interact_expr
+                mood_for_hud = self.interact_expr
+            elif is_dozing_now:
+                expr = "blink"
+                kb_pose = "mid"
+                mood_for_hud = "doze"
+                if now >= self._next_zzz_at:
+                    self._next_zzz_at = now + 1.15
+                    sx0, sy0, sw0, sh0 = self._sprite_rect
+                    z_char = "Z" if random.random() < 0.55 else "z"
+                    self._spawn_particle(
+                        "zzz",
+                        sx0 + sw0 * 0.68 + random.uniform(-6.0, 10.0) * dpi,
+                        sy0 + sh0 * 0.24,
+                        now,
+                        vx=random.uniform(9.0, 16.0) * dpi,
+                        vy=random.uniform(-28.0, -20.0) * dpi,
+                        life=2.1,
+                        size=12.0 * dpi,
+                        color=(122, 152, 224),
+                        text=z_char,
+                    )
+
         is_frantic = (expr == "frantic" or mood_for_hud == "frantic")
         pack = self.packs[self.config["outfit"]]
-        dpi = self._dpi_factor()
         base_px = int(round(self.BASE_DISPLAY_PX * dpi * self.config["scale"]))
         sprite = pack.get_frame(expr, mouse_pose, kb_pose, base_px)
 
         # Draw pixel-aligned glowing keycaps & mouse click ripple directly on sprite before squash-stretch
         sprite = self._draw_tray_highlights(sprite, pack, glow_keys, mouse_pose, mouse_click_alpha, is_frantic)
 
-        # Micro-physics: gentle breathing + crisp Q-bounce on keystrokes + pop on outfit switch
+        # Micro-physics: gentle breathing + Q-bounce + headpat nuzzle + cheek poke wiggle + drag sway
         t = now - self.start_time
-        breath_y = math.sin(t * 2.3) * 1.4
+        if is_dozing_now:
+            breath_y = math.sin(t * 1.15) * 2.2 * dpi
+        else:
+            breath_y = math.sin(t * 2.3) * 1.4 * dpi
         sx = 1.0
         sy = 1.0
         shake_x = 0.0
@@ -1106,10 +1596,45 @@ class ChibiDesktopPet:
             amp = 0.032 if is_frantic else 0.020
             sx = 1.0 + amp * impulse
             sy = 1.0 - amp * 0.90 * impulse
-            offset_y += 2.6 * impulse
+            offset_y += 2.6 * impulse * dpi
 
         if is_frantic and hit_age < 0.25:
-            shake_x = math.sin(t * 56.0) * 1.6
+            shake_x += math.sin(t * 56.0) * 1.6 * dpi
+
+        if is_headpat:
+            # Cozy nuzzle squish & soft rubbing sway
+            sx += 0.024
+            sy -= 0.022
+            shake_x += math.sin(t * 13.0) * 2.4 * dpi
+            offset_y += 1.6 * dpi
+
+        if now < self.poke_shake_until:
+            rem = self.poke_shake_until - now
+            amp_x = 4.2 * dpi if self.poke_combo >= 3 else 3.0 * dpi
+            shake_x += math.sin(t * 42.0) * amp_x * min(1.0, rem / 0.30)
+            sx += 0.018 * min(1.0, rem / 0.25)
+            sy -= 0.016 * min(1.0, rem / 0.25)
+
+        if now < self.welcome_hop_until:
+            hp = 1.0 - (self.welcome_hop_until - now) / 0.34
+            hop = math.sin(hp * math.pi)
+            offset_y -= 9.0 * dpi * hop
+            sx -= 0.025 * hop
+            sy += 0.035 * hop
+
+        if now < self.land_pop_until:
+            lp = 1.0 - (self.land_pop_until - now) / 0.18
+            land = math.sin(lp * math.pi)
+            sx += 0.032 * land
+            sy -= 0.028 * land
+            offset_y += 2.2 * dpi * land
+
+        if self.dragging:
+            self._drag_sway *= 0.84
+            shake_x += max(-6.0 * dpi, min(6.0 * dpi, self._drag_sway))
+            offset_y -= 2.5 * dpi
+        else:
+            self._drag_sway *= 0.75
 
         if now < self.outfit_pop_until:
             pop_p = 1.0 - (self.outfit_pop_until - now) / 0.24
@@ -1126,22 +1651,34 @@ class ChibiDesktopPet:
         anchor_bottom = int(round(self.CANVAS_PAD_TOP * dpi)) + sh
         px = int(round((self.canvas_w - rw) / 2.0 + shake_x))
         py = int(round(anchor_bottom - rh + offset_y))
+        self._sprite_rect = (px, py, rw, rh)
         canvas.alpha_composite(draw_sprite, (px, py))
+
+        # Floating interactive particles (vector hearts, cheek sparkles, dozing Zzz)
+        canvas = self._draw_particles(canvas, now, static_particles=static_particles)
+
+        # Mini hand-drawn pastel reaction speech bubble above head
+        if ov_bubble is not None:
+            canvas = self._draw_reaction_bubble(canvas, pack, ov_bubble[0], ov_bubble[1], ov_bubble[2])
+        elif self.bubble_text and now < self.bubble_until:
+            canvas = self._draw_reaction_bubble(
+                canvas, pack, self.bubble_text, now - self.bubble_start_at, self.bubble_until - self.bubble_start_at
+            )
 
         # Floating pastel mechanical keycap pills (shows exact keys pressed!)
         if self.config.get("show_keycaps", True) and pills:
             self._draw_keycap_pills(canvas, pack, pills, is_frantic)
         elif self.config.get("show_hud", True) and (self.hovering or is_frantic or show_hud_force):
             # Hover/frantic speed badge when no keycap pills are occupying the bottom bar
-            mood_txt = MOOD_LABELS.get(expr, "陪伴中")
+            mood_txt = MOOD_LABELS.get(mood_for_hud, MOOD_LABELS.get(expr, "陪伴中"))
             speed_txt = f"{kps:.1f}/s · {mood_txt}" if kps >= 0.3 else f"★ {mood_txt}"
             draw = ImageDraw.Draw(canvas)
             bbox = draw.textbbox((0, 0), speed_txt, font=self._hud_font)
             tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            pad_x, pad_y = 12, 5
+            pad_x, pad_y = int(round(12 * dpi)), int(round(5 * dpi))
             pill_w, pill_h = tw + pad_x * 2, th + pad_y * 2
             rx1 = (self.canvas_w - pill_w) // 2
-            ry1 = self.canvas_h - pill_h - 10
+            ry1 = self.canvas_h - pill_h - int(round(10 * dpi))
             bg_col = (232, 92, 92, 220) if is_frantic else (52, 40, 38, 198)
             draw.rounded_rectangle(
                 (rx1, ry1, rx1 + pill_w, ry1 + pill_h),
@@ -1301,6 +1838,10 @@ class ChibiDesktopPet:
         user32.AppendMenuW(menu, MF_POPUP, sens_menu, "🎛️ 变脸手速阈值")
 
         user32.AppendMenuW(
+            menu, MF_STRING | (MF_CHECKED if self.config.get("enable_interactions", True) else 0),
+            CMD_TOGGLE_INTERACT, "🤗 亲密微互动（摸头/戳脸/打瞌睡）",
+        )
+        user32.AppendMenuW(
             menu, MF_STRING | (MF_CHECKED if self.config.get("show_keycaps", True) else 0),
             CMD_TOGGLE_KEYCAPS, "⌨️ 显示实时按键键帽",
         )
@@ -1350,6 +1891,16 @@ class ChibiDesktopPet:
             self._save_config()
         elif cmd == CMD_CLICK_THROUGH:
             self._set_click_through(not self.click_through)
+        elif cmd == CMD_TOGGLE_INTERACT:
+            enabled = not self.config.get("enable_interactions", True)
+            self.config["enable_interactions"] = enabled
+            if not enabled:
+                self.is_dozing = False
+                self.headpat_until = 0.0
+                self.interact_expr_until = 0.0
+                self.bubble_until = 0.0
+                self.particles.clear()
+            self._save_config()
         elif cmd == CMD_TOGGLE_KEYCAPS:
             self.config["show_keycaps"] = not self.config.get("show_keycaps", True)
             self._save_config()
@@ -1412,35 +1963,69 @@ class ChibiDesktopPet:
         if msg == WM_LBUTTONDOWN:
             pt = POINT()
             user32.GetCursorPos(ctypes.byref(pt))
-            self.dragging = True
+            self._lbtn_down = True
+            self.dragging = False
+            self._down_screen = (pt.x, pt.y)
+            self._down_local = (pt.x - self.win_x, pt.y - self.win_y)
             self.drag_offset = (pt.x - self.win_x, pt.y - self.win_y)
+            self._last_drag_x = pt.x
             user32.SetCapture(hwnd)
             return 0
 
         if msg == WM_MOUSEMOVE:
+            now = time.perf_counter()
             if not self.hovering:
                 self.hovering = True
                 tme = TRACKMOUSEEVENT(ctypes.sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0)
                 user32.TrackMouseEvent(ctypes.byref(tme))
-            if self.dragging:
-                pt = POINT()
-                user32.GetCursorPos(ctypes.byref(pt))
-                self.win_x = pt.x - self.drag_offset[0]
-                self.win_y = pt.y - self.drag_offset[1]
+            pt = POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            if self._lbtn_down:
+                dist = math.hypot(pt.x - self._down_screen[0], pt.y - self._down_screen[1])
+                if not self.dragging and dist >= 6.0 * self._dpi_factor():
+                    self.dragging = True
+                    self._pending_poke_at = 0.0
+                    self._note_user_activity(now)
+                if self.dragging:
+                    vx = pt.x - self._last_drag_x
+                    self._last_drag_x = pt.x
+                    self._drag_sway = self._drag_sway * 0.65 - vx * 0.25
+                    self.win_x = pt.x - self.drag_offset[0]
+                    self.win_y = pt.y - self.drag_offset[1]
+            else:
+                self._handle_headpat_move(pt.x - self.win_x, pt.y - self.win_y, now)
             return 0
 
         if msg == WM_MOUSELEAVE:
             self.hovering = False
+            self._last_pat_pos = None
             return 0
 
         if msg == WM_LBUTTONUP:
-            if self.dragging:
-                self.dragging = False
+            now = time.perf_counter()
+            was_down = self._lbtn_down
+            was_dragging = self.dragging
+            self._lbtn_down = False
+            self.dragging = False
+            if was_down:
                 user32.ReleaseCapture()
+            if was_dragging:
+                self.land_pop_until = now + 0.18
                 self._save_config()
+            elif was_down and self._interactions_enabled():
+                # Stationary click: check if it landed on her soft cheeks -> defer 230ms so double-click can cancel it!
+                lx, ly = self._down_local
+                sx, sy, sw, sh = self._sprite_rect
+                if sw > 10 and sh > 10:
+                    rx = (lx - sx) / float(sw)
+                    ry = (ly - sy) / float(sh)
+                    if (0.24 <= rx <= 0.76) and (0.35 <= ry <= 0.63):
+                        self._pending_poke_at = now + 0.23
+                        self._pending_poke_pos = (lx, ly)
             return 0
 
         if msg == WM_LBUTTONDBLCLK:
+            self._pending_poke_at = 0.0
             self._toggle_outfit()
             return 0
 
@@ -1588,6 +2173,62 @@ class ChibiDesktopPet:
                     "mouse_click_alpha": 0.0, "kps": 12.2, "hit_age": 0.04,
                 }),
             ])
+
+        # v1.1.0 Intimate Micro-Interaction verification scenarios (headpat, cheek poke, doze Zzz, welcome back)
+        dpi = self._dpi_factor()
+        w_est = self.canvas_w
+        top_y = int(round(self.CANVAS_PAD_TOP * dpi))
+        scenarios.extend([
+            ("08_interact_headpat_bear", "bear", {
+                "expr": "blink", "mouse_pose": "center", "kb_pose": "mid",
+                "headpat": True, "mood_label": "headpat", "show_hud": True,
+                "bubble": ("嘿嘿好舒服~", 0.45, 2.0),
+                "particles": [
+                    {"kind": "heart", "x": w_est * 0.28, "y": top_y + 42 * dpi, "vx": -10 * dpi, "vy": -36 * dpi,
+                     "static_age": 0.45, "life": 1.4, "size": 12.0 * dpi, "color": (255, 112, 148), "phase": 0.4, "text": ""},
+                    {"kind": "heart", "x": w_est * 0.73, "y": top_y + 34 * dpi, "vx": 10 * dpi, "vy": -34 * dpi,
+                     "static_age": 0.35, "life": 1.4, "size": 10.5 * dpi, "color": (255, 142, 174), "phase": 1.8, "text": ""},
+                    {"kind": "heart", "x": w_est * 0.67, "y": top_y + 24 * dpi, "vx": 6 * dpi, "vy": -30 * dpi,
+                     "static_age": 0.68, "life": 1.4, "size": 9.0 * dpi, "color": (255, 96, 128), "phase": 2.9, "text": ""},
+                ],
+            }),
+            ("09_interact_poke_summer", "summer", {
+                "expr": "focused", "mouse_pose": "center", "kb_pose": "up",
+                "bubble": ("干嘛戳我呀~", 0.35, 1.9),
+                "particles": [
+                    {"kind": "sparkle", "x": w_est * 0.34, "y": top_y + 150 * dpi, "vx": -28 * dpi, "vy": -18 * dpi,
+                     "static_age": 0.32, "life": 0.9, "size": 10.5 * dpi, "color": (255, 204, 86), "phase": 0.2, "text": ""},
+                    {"kind": "sparkle", "x": w_est * 0.31, "y": top_y + 168 * dpi, "vx": -20 * dpi, "vy": 12 * dpi,
+                     "static_age": 0.26, "life": 0.9, "size": 9.0 * dpi, "color": (255, 148, 168), "phase": 1.5, "text": ""},
+                    {"kind": "sparkle", "x": w_est * 0.38, "y": top_y + 138 * dpi, "vx": -12 * dpi, "vy": -28 * dpi,
+                     "static_age": 0.38, "life": 0.9, "size": 8.5 * dpi, "color": (255, 224, 130), "phase": 2.4, "text": ""},
+                ],
+            }),
+            ("10_interact_doze_daily", "daily", {
+                "expr": "blink", "mouse_pose": "center", "kb_pose": "mid",
+                "dozing": True, "mood_label": "doze", "show_hud": True,
+                "particles": [
+                    {"kind": "zzz", "x": w_est * 0.68, "y": top_y + 62 * dpi, "vx": 12 * dpi, "vy": -24 * dpi,
+                     "static_age": 0.35, "life": 2.1, "size": 12 * dpi, "color": (122, 152, 224), "phase": 0.3, "text": "z"},
+                    {"kind": "zzz", "x": w_est * 0.72, "y": top_y + 54 * dpi, "vx": 14 * dpi, "vy": -26 * dpi,
+                     "static_age": 0.95, "life": 2.1, "size": 14 * dpi, "color": (110, 142, 220), "phase": 1.6, "text": "Z"},
+                    {"kind": "zzz", "x": w_est * 0.76, "y": top_y + 48 * dpi, "vx": 15 * dpi, "vy": -28 * dpi,
+                     "static_age": 1.45, "life": 2.1, "size": 16 * dpi, "color": (102, 134, 214), "phase": 2.8, "text": "Z"},
+                ],
+            }),
+            ("11_interact_welcome_bear", "bear", {
+                "expr": "happy", "mouse_pose": "center", "kb_pose": "up",
+                "bubble": ("回来啦~", 0.35, 2.4),
+                "particles": [
+                    {"kind": "sparkle", "x": w_est * 0.26, "y": top_y + 52 * dpi, "vx": -22 * dpi, "vy": -24 * dpi,
+                     "static_age": 0.38, "life": 1.1, "size": 11.0 * dpi, "color": (255, 204, 78), "phase": 0.5, "text": ""},
+                    {"kind": "sparkle", "x": w_est * 0.74, "y": top_y + 48 * dpi, "vx": 22 * dpi, "vy": -24 * dpi,
+                     "static_age": 0.34, "life": 1.1, "size": 10.5 * dpi, "color": (126, 206, 255), "phase": 1.4, "text": ""},
+                    {"kind": "heart", "x": w_est * 0.68, "y": top_y + 34 * dpi, "vx": 10 * dpi, "vy": -30 * dpi,
+                     "static_age": 0.42, "life": 1.4, "size": 11.0 * dpi, "color": (255, 118, 152), "phase": 2.2, "text": ""},
+                ],
+            }),
+        ])
 
         msg = wt.MSG()
         for name, outfit, ov in scenarios:
