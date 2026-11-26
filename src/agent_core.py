@@ -33,15 +33,15 @@ PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
         "label": "Google Gemini（官方直连 · 原生多模态）",
         "protocol": "gemini",
         "base_url": "https://generativelanguage.googleapis.com",
-        "default_model": "gemini-2.5-flash",
+        "default_model": "gemini-3-flash-preview",
         "vision_capable": "yes",
-        "hint": "在 Google AI Studio 获取 API Key；国内直连可填本地代理地址（如 http://127.0.0.1:7890）或中转 Base URL。",
+        "hint": "推荐模型 gemini-3-flash-preview 或 gemini-flash-lite-latest；国内直连请填本地代理（如 http://127.0.0.1:7890）。",
     },
     "gemini_openai": {
         "label": "Google Gemini（OpenAI 兼容接口）",
         "protocol": "openai",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-2.5-flash",
+        "default_model": "gemini-3-flash-preview",
         "vision_capable": "yes",
         "hint": "兼容各类 Gemini OpenAI 中转站，填中转 Base URL 与 Key 即可。",
     },
@@ -121,8 +121,8 @@ VISION_PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
     },
     "gemini": {
         "label": "Google Gemini Vision（官方直连）",
-        "default_model": "gemini-2.5-flash",
-        "hint": "原生多模态强项；国内直连可填本地代理地址。",
+        "default_model": "gemini-3-flash-preview",
+        "hint": "原生多模态强项（也可用 gemini-flash-lite-latest）；国内直连填本地代理地址（如 http://127.0.0.1:7890）。",
     },
     "doubao": {
         "label": "豆包视觉 (火山方舟)",
@@ -180,7 +180,7 @@ def default_ai_config() -> dict:
         "provider": "gemini",
         "api_key": "",
         "base_url": "",
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3-flash-preview",
         "vision_model": "",
         "vision": {
             "provider": "",
@@ -749,9 +749,11 @@ class AgentCore:
             if code in (401, 403):
                 return f"鉴权失败 ({code})：请检查 API Key 是否正确或有权限"
             if code == 404:
-                return f"模型或地址未找到 (404)：请检查模型名「{cfg.get('model')}」和 Base URL"
+                return f"模型或地址未找到 (404)：请检查模型名「{cfg.get('model')}」（{body or '模型可能已下线或名称有误'}）"
             if code == 429:
                 return "请求太频繁或额度用完啦 (429)，稍等一下再试试~"
+            if code == 503:
+                return f"模型「{cfg.get('model')}」当前高峰期繁忙 (503)，稍等几秒重试或换 gemini-flash-lite-latest 试试~"
             return f"接口报错 HTTP {code}：{body or exc.reason}"
         if isinstance(exc, urllib.error.URLError):
             prov = cfg.get("provider", "gemini")

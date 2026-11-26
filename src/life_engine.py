@@ -168,31 +168,77 @@ def detect_location_by_ip(timeout: float = 4.5) -> Optional[Tuple[str, float, fl
     return None
 
 
+# Built-in fast coordinate index for major Chinese cities (avoids GeoNames suffix quirks like 厦门/厦门市)
+CN_CITY_COORDS: Dict[str, Tuple[float, float]] = {
+    "北京": (39.9042, 116.4074), "上海": (31.2304, 121.4737), "广州": (23.1291, 113.2644),
+    "深圳": (22.5431, 114.0579), "杭州": (30.2741, 120.1551), "南京": (32.0603, 118.7969),
+    "苏州": (31.2989, 120.5853), "武汉": (30.5928, 114.3055), "成都": (30.5728, 104.0668),
+    "重庆": (29.5630, 106.5516), "西安": (34.3416, 108.9398), "天津": (39.3434, 117.3616),
+    "长沙": (28.2282, 112.9388), "郑州": (34.7466, 113.6253), "青岛": (36.0671, 120.3826),
+    "济南": (36.6512, 117.1201), "合肥": (31.8206, 117.2272), "厦门": (24.4798, 118.0894),
+    "福州": (26.0745, 119.2965), "泉州": (24.8741, 118.6757), "漳州": (24.5130, 117.6471),
+    "莆田": (25.4541, 119.0078), "宁德": (26.6657, 119.5479), "龙岩": (25.0751, 117.0177),
+    "三明": (26.2634, 117.6387), "南平": (26.6418, 118.1777), "宁波": (29.8683, 121.5440),
+    "温州": (27.9938, 120.6994), "嘉兴": (30.7461, 120.7555), "绍兴": (30.0303, 120.5802),
+    "金华": (29.0791, 119.6474), "台州": (28.6564, 121.4208), "无锡": (31.4912, 120.3119),
+    "常州": (31.8112, 119.9741), "南通": (31.9802, 120.8943), "扬州": (32.3942, 119.4129),
+    "徐州": (34.2058, 117.2841), "沈阳": (41.8057, 123.4315), "大连": (38.9140, 121.6147),
+    "长春": (43.8171, 125.3235), "哈尔滨": (45.8038, 126.5350), "昆明": (24.8801, 102.8329),
+    "贵阳": (26.6470, 106.6302), "南宁": (22.8170, 108.3665), "桂林": (25.2736, 110.2900),
+    "海口": (20.0440, 110.1999), "三亚": (18.2528, 109.5119), "南昌": (28.6829, 115.8582),
+    "太原": (37.8706, 112.5489), "石家庄": (38.0428, 114.5149), "呼和浩特": (40.8424, 111.7490),
+    "兰州": (36.0611, 103.8343), "银川": (38.4872, 106.2309), "西宁": (36.6171, 101.7782),
+    "乌鲁木齐": (43.8256, 87.6168), "拉萨": (29.6500, 91.1000), "珠海": (22.2710, 113.5767),
+    "佛山": (23.0215, 113.1214), "东莞": (23.0207, 113.7518), "中山": (22.5176, 113.3928),
+    "惠州": (23.1118, 114.4162), "汕头": (23.3541, 116.6819), "烟台": (37.4638, 121.4479),
+    "威海": (37.5131, 122.1204), "潍坊": (36.7067, 119.1618), "洛阳": (34.6197, 112.4540),
+    "宜昌": (30.6919, 111.2865), "香港": (22.3193, 114.1694), "澳门": (22.1987, 113.5439),
+    "台北": (25.0330, 121.5654), "高雄": (22.6273, 120.3014),
+}
+
+
 def geocode_city(city_name: str, timeout: float = 5.0) -> Optional[Tuple[str, float, float]]:
-    """Resolve Chinese or English city name to (display_name, lat, lon) via Open-Meteo Geocoding."""
+    """Resolve Chinese or English city name to (display_name, lat, lon) with built-in CN index + Open-Meteo."""
     raw = city_name.strip()
     if not raw:
         return None
-    candidates = [raw]
-    for suffix in ("市", "区", "县"):
-        if raw.endswith(suffix) and len(raw) >= 2:
-            candidates.append(raw[:-1])
+
+    # 1. Instant match in built-in CN city map (handles both "厦门" and "厦门市")
+    core = raw
+    for suffix in ("市", "特别行政区"):
+        if core.endswith(suffix) and len(core) >= 2:
+            core = core[: -len(suffix)]
+    if core in CN_CITY_COORDS:
+        lat, lon = CN_CITY_COORDS[core]
+        return core, lat, lon
+
+    # 2. Bidirectional Chinese suffix expansion for all other cities/counties/districts
+    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in raw)
+    candidates: List[str] = [raw]
+    if has_cjk:
+        stripped = False
+        for suffix in ("市", "区", "县"):
+            if raw.endswith(suffix) and len(raw) >= 2:
+                candidates.append(raw[:-1])
+                stripped = True
+        if not stripped:
+            candidates.extend([raw + "市", raw + "县", raw + "区"])
 
     for cand in candidates:
         q = urllib.parse.quote(cand)
-        url = f"https://geocoding-api.open-meteo.com/v1/search?name={q}&count=3&language=zh&format=json"
+        url = f"https://geocoding-api.open-meteo.com/v1/search?name={q}&count=5&language=zh&format=json"
         data = _http_get_json(url, timeout=timeout)
         results = (data or {}).get("results") or []
         if results:
-            # Prefer China match if user entered Chinese characters
-            has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in cand)
             chosen = results[0]
             if has_cjk:
-                for r in results:
-                    if r.get("country_code") == "CN":
-                        chosen = r
-                        break
+                cn_matches = [r for r in results if r.get("country_code") == "CN"]
+                if cn_matches:
+                    cn_matches.sort(key=lambda r: int(r.get("population") or 0), reverse=True)
+                    chosen = cn_matches[0]
             name = str(chosen.get("name") or cand)
+            if name.endswith("市") and len(name) >= 3:
+                name = name[:-1]
             return name, float(chosen["latitude"]), float(chosen["longitude"])
     return None
 

@@ -21,12 +21,22 @@ from life_engine import (
     LifeEngine,
     WeatherInfo,
     classify_day_period,
+    geocode_city,
     recommend_outfit_for_weather,
 )
 
 
 class TestWeatherOutfitMapping(unittest.TestCase):
     ALL_PACKS = ("bear", "daily", "summer", "hoodie", "puffer")
+
+    def test_xiamen_and_cn_city_geocoding(self) -> None:
+        loc1 = geocode_city("厦门")
+        self.assertIsNotNone(loc1)
+        self.assertEqual(loc1[0], "厦门")
+        self.assertAlmostEqual(loc1[1], 24.48, delta=0.1)
+        loc2 = geocode_city("厦门市")
+        self.assertIsNotNone(loc2)
+        self.assertEqual(loc2[0], "厦门")
 
     def test_cold_and_snow_pick_puffer(self) -> None:
         outfit, _ = recommend_outfit_for_weather(8.5, 0, 14, True, self.ALL_PACKS)

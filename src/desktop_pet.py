@@ -16,7 +16,7 @@ Features:
 from __future__ import annotations
 
 APP_NAME = "开开陪玩"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 WINDOW_CLASS_NAME = "KaikaiPeiwanPetWindow"
 LEGACY_WINDOW_CLASS_NAME = "ChibiTypingCompanionPetWindowV5"
 
@@ -51,8 +51,8 @@ from agent_tools import (
 )
 from audio_rhythm import AudioRhythmMonitor
 from chat_ui import DetailNoteCard, FloatingChatBar
+from control_center import ControlCenterServer, VALID_OUTFITS
 from life_engine import LifeEngine, LifeEvent, OUTFIT_DISPLAY_NAMES, show_city_input_dialog
-from settings_web import LocalSettingsServer
 
 # ---------------------------------------------------------------------------
 # High-DPI awareness (must run before any window creation)
@@ -122,9 +122,11 @@ MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_NOREPEAT = 0x4000
 VK_K = 0x4B
+VK_O = 0x4F
 VK_T = 0x54
 HOTKEY_ID_CHAT = 9001
 HOTKEY_ID_CLIPBOARD = 9002
+HOTKEY_ID_STUDIO = 9003
 
 WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
@@ -800,6 +802,8 @@ class ChibiDesktopPet:
         self.tool_registry.register("inspect_screen", "按需截取当前屏幕", capture_screen_jpeg_b64)
         self._ai_lock = threading.Lock()
         self._ai_reply_queue: deque[ChatReply] = deque()
+        self._studio_cmd_lock = threading.Lock()
+        self._studio_cmd_queue: deque[dict] = deque()
         self.ai_thinking = False
         self._bubble_rect = (0, 0, 0, 0)
         self.chat_bar: Optional[FloatingChatBar] = None
@@ -808,7 +812,9 @@ class ChibiDesktopPet:
         self._chat_hotkey_label = "Ctrl+Shift+K"
         self._clip_hotkey_registered = False
         self._clip_hotkey_label = "Ctrl+Shift+T"
-        self.settings_server = LocalSettingsServer(
+        self._studio_hotkey_registered = False
+        self._studio_hotkey_label = "Ctrl+Shift+O"
+        self.settings_server = ControlCenterServer(
             agent=self.agent_core,
             get_life_state=self._get_life_settings_dict,
             apply_life_update=self._apply_life_settings_update,
@@ -817,6 +823,10 @@ class ChibiDesktopPet:
             get_reminders=self.reminders.list_active,
             add_reminder=self._add_reminder_from_web,
             delete_reminder=self._delete_reminder_from_web,
+            resource_root=self.resource_root,
+            get_pet_state=self._get_pet_state_for_studio,
+            apply_pet_control=self._apply_studio_control,
+            send_chat=self._send_chat_from_studio,
         )
         self._last_music_beat_seq = 0
         self._next_music_note_at = 0.0
@@ -925,6 +935,7 @@ class ChibiDesktopPet:
             "sedentary_minutes": 45,
             "scene_awareness_enabled": True,
             "reminder_sound_enabled": True,
+            "control_center_theme": "light",
         }
         if self.config_path.exists():
             try:
@@ -1439,7 +1450,275 @@ class ChibiDesktopPet:
             )
 
     def _open_ai_settings(self) -> None:
-        self.settings_server.open_in_browser()
+        self.settings_server.open_in_app_window()
+
+    def _get_pet_state_for_studio(self) -> dict:
+        w = self.life_engine.last_weather
+        if w:
+            w_text = f"{w.city} {round(w.temp_c)}°C {w.desc_zh}"
+        else:
+            city_cfg = str(self.config.get("weather_city", "")).strip()
+            w_text = f"{city_cfg} 天气同步中" if city_cfg else "天气同步中"
+        return {
+            "outfit": str(self.config.get("outfit", "bear")),
+            "scale": float(self.config.get("scale", 1.0)),
+            "always_on_top": bool(self.config.get("always_on_top", True)),
+            "click_through": bool(self.click_through),
+            "show_keycaps": bool(self.config.get("show_keycaps", True)),
+            "show_hud": bool(self.config.get("show_hud", True)),
+            "enable_interactions": bool(self.config.get("enable_interactions", True)),
+            "music_rhythm_enabled": bool(self.config.get("music_rhythm_enabled", True)),
+            "scene_awareness_enabled": bool(self.config.get("scene_awareness_enabled", True)),
+            "reminder_sound_enabled": bool(self.config.get("reminder_sound_enabled", True)),
+            "mood_sensitivity": str(self.config.get("mood_sensitivity", "normal")),
+            "control_center_theme": str(self.config.get("control_center_theme", "light")),
+            "days_accompanied": int(self.life_engine.stats.data.get("days_accompanied", 1)),
+            "today_keys": int(self.life_engine.stats.data.get("today_keys", 0)),
+            "weather_text": w_text,
+            "hotkeys": {
+                "studio": self._studio_hotkey_label,
+                "chat": self._chat_hotkey_label,
+                "clipboard": self._clip_hotkey_label,
+            },
+        }
+
+    def _apply_studio_control(self, cmd: dict) -> dict:
+        """Accept live control commands from Control Studio HTTP thread & marshal Win32 ops to UI thread."""
+        action = str(cmd.get("action") or "").strip()
+        if action == "set_theme":
+            theme = "dark" if str(cmd.get("theme") or "") == "dark" else "light"
+            self.config["control_center_theme"] = theme
+            self._save_config()
+            return self._get_pet_state_for_studio()
+
+        # Enqueue for immediate execution on main Win32 UI thread in _render_frame
+        with self._studio_cmd_lock:
+            self._studio_cmd_queue.append(dict(cmd))
+
+        # Reflect optimistic snapshot immediately for snappy Studio UI feedback
+        snap = self._get_pet_state_for_studio()
+        if action == "set_outfit":
+            oid = str(cmd.get("outfit") or "")
+            if oid in self.packs:
+                snap["outfit"] = oid
+        elif action == "set_scale":
+            try:
+                snap["scale"] = max(0.55, min(1.75, round(float(cmd.get("scale", 1.0)), 2)))
+            except Exception:
+                pass
+        elif action == "set_sensitivity":
+            val = str(cmd.get("value") or "")
+            if val in ("chill", "normal", "lively"):
+                snap["mood_sensitivity"] = val
+        elif action == "set_toggle":
+            key = str(cmd.get("key") or "")
+            if key in snap:
+                snap[key] = bool(cmd.get("value"))
+        return snap
+
+    def _drain_studio_commands(self, now: float) -> None:
+        """Execute queued Control Studio commands safely on the main Win32 thread."""
+        while True:
+            with self._studio_cmd_lock:
+                cmd = self._studio_cmd_queue.popleft() if self._studio_cmd_queue else None
+            if cmd is None:
+                break
+            action = str(cmd.get("action") or "").strip()
+            if action == "set_outfit":
+                oid = str(cmd.get("outfit") or "")
+                if oid in self.packs:
+                    self._toggle_outfit(oid, manual=True)
+            elif action == "set_scale":
+                try:
+                    self._set_scale(float(cmd.get("scale", 1.0)))
+                except Exception:
+                    pass
+            elif action == "set_sensitivity":
+                val = str(cmd.get("value") or "")
+                if val in ("chill", "normal", "lively"):
+                    self.config["mood_sensitivity"] = val
+                    self._save_config()
+            elif action == "set_toggle":
+                key = str(cmd.get("key") or "")
+                val = bool(cmd.get("value"))
+                if key == "always_on_top":
+                    self._set_topmost(val)
+                elif key == "click_through":
+                    self._set_click_through(val)
+                elif key == "enable_interactions":
+                    self.config["enable_interactions"] = val
+                    if not val:
+                        self.is_dozing = False
+                        self.headpat_until = 0.0
+                        self.interact_expr_until = 0.0
+                        self.bubble_until = 0.0
+                        self.particles.clear()
+                    self._save_config()
+                elif key == "music_rhythm_enabled":
+                    self.config["music_rhythm_enabled"] = val
+                    self.audio_rhythm.set_enabled(val)
+                    self._save_config()
+                elif key in (
+                    "show_keycaps",
+                    "show_hud",
+                    "scene_awareness_enabled",
+                    "reminder_sound_enabled",
+                    "weather_auto_outfit",
+                    "night_bear_mode",
+                    "life_care_enabled",
+                ):
+                    self.config[key] = val
+                    self._save_config()
+            elif action == "reset_pos":
+                sw = user32.GetSystemMetrics(SM_CXSCREEN)
+                sh = user32.GetSystemMetrics(SM_CYSCREEN)
+                self.win_x = max(20, sw - self.canvas_w - 36)
+                self.win_y = max(20, sh - self.canvas_h - 56)
+                self._save_config()
+            elif action == "refresh_weather":
+                self._show_bubble("马上帮你查最新天气~", now, duration=2.2)
+                self.life_engine.request_weather_refresh(
+                    str(self.config.get("weather_city", "")),
+                    available_packs=self.packs.keys(),
+                    auto_outfit=bool(self.config.get("weather_auto_outfit", True)),
+                    night_bear_mode=bool(self.config.get("night_bear_mode", True)),
+                    force_outfit=True,
+                    announce=True,
+                )
+            elif action == "trigger_clipboard":
+                self._run_clipboard_assist()
+            elif action == "trigger_screen":
+                self._run_screen_inspect()
+            elif action == "studio_bubble":
+                mood = str(cmd.get("mood") or "happy")
+                if mood not in ("idle", "happy", "focused", "frantic", "blink"):
+                    mood = "happy"
+                self.interact_expr = mood
+                self.interact_expr_until = now + 4.8
+                txt = str(cmd.get("bubble") or "").strip()
+                if txt:
+                    self._show_bubble(txt, now, duration=5.0 if len(txt) > 16 else 4.2)
+                if cmd.get("celebrate"):
+                    self.welcome_hop_until = now + 0.28
+                    self._burst_celebrate_particles(now, hearts=False)
+                tool_act = cmd.get("tool_action")
+                if isinstance(tool_act, dict):
+                    try:
+                        self._execute_tool_action(tool_act, now)
+                    except Exception:
+                        pass
+
+    def _send_chat_from_studio(self, text: str, mode: str = "chat") -> dict:
+        """Handle rich chat / clipboard / screen requests initiated from Control Studio."""
+        ts_now = time.strftime("%H:%M")
+
+        def _notify_pet(mood: str, bubble: str, celebrate: bool = False, tool_action: Optional[dict] = None) -> None:
+            with self._studio_cmd_lock:
+                self._studio_cmd_queue.append(
+                    {
+                        "action": "studio_bubble",
+                        "mood": mood,
+                        "bubble": bubble,
+                        "celebrate": celebrate,
+                        "tool_action": tool_action,
+                    }
+                )
+
+        if mode == "chat" and text:
+            rem_intent = parse_natural_reminder(text)
+            if rem_intent is not None:
+                rec = self.reminders.add(title=rem_intent.title, delay_secs=rem_intent.delay_secs, kind=rem_intent.kind)
+                msg = (
+                    f"好嘞！{rec['duration_mins']}分钟番茄钟开跑，{rec['due_label']} 喊你休息~"
+                    if rem_intent.kind == "pomodoro"
+                    else f"记下啦！{rec['due_label']} 准时喊你「{rec['title']}」~"
+                )
+                _notify_pet("happy", msg, celebrate=True)
+                return {
+                    "reply": {"mood": "happy", "bubble": msg, "detail": "", "error": "", "ts": ts_now, "local_only": True},
+                    "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+                    "reminders": self.reminders.list_active(),
+                }
+
+        ctx = self._get_runtime_context()
+
+        if mode == "clipboard":
+            if not self.agent_core.has_credentials():
+                return {
+                    "reply": {"mood": "focused", "bubble": "还没配置主模型 API Key，请先到「05 引擎与隐私」填写~", "detail": "", "error": "missing_key", "ts": ts_now, "local_only": True},
+                    "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+                    "reminders": self.reminders.list_active(),
+                }
+            clip_txt, err = read_clipboard_text()
+            if err or not clip_txt:
+                return {
+                    "reply": {"mood": "idle", "bubble": err or "剪贴板里暂时没有文本哦~", "detail": "", "error": "", "ts": ts_now, "local_only": True},
+                    "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+                    "reminders": self.reminders.list_active(),
+                }
+            if looks_like_secret(clip_txt):
+                return {
+                    "reply": {"mood": "focused", "bubble": "这段内容像密钥或密码，为了隐私安全已拦截，未发送给模型~", "detail": "", "error": "", "ts": ts_now, "local_only": True},
+                    "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+                    "reminders": self.reminders.list_active(),
+                }
+            _, auto_prompt = classify_clipboard_intent(clip_txt)
+            prompt = (
+                f"用户的要求：{text}\n用户剪贴板内容（完整结果放 detail，bubble 写一句简短回应）：\n\n{clip_txt}"
+                if text
+                else auto_prompt
+            )
+            rep = self.agent_core.chat_sync(prompt, ctx, save_to_memory=False)
+            _notify_pet(rep.mood, rep.bubble, celebrate=not bool(rep.error))
+            return {
+                "reply": {"mood": rep.mood, "bubble": rep.bubble, "detail": rep.detail, "error": rep.error, "ts": ts_now, "local_only": True},
+                "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+                "reminders": self.reminders.list_active(),
+            }
+
+        if mode == "screen":
+            v_cfg, v_err = self.agent_core.resolve_vision_config()
+            if not v_cfg:
+                return {
+                    "reply": {"mood": "focused", "bubble": "尚未配置多模态视觉分流通道", "detail": v_err, "error": "missing_vision", "ts": ts_now, "local_only": True},
+                    "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+                    "reminders": self.reminders.list_active(),
+                }
+            b64, _sz, cap_err = capture_screen_jpeg_b64()
+            if cap_err or not b64:
+                return {
+                    "reply": {"mood": "focused", "bubble": cap_err or "截屏失败，请重试~", "detail": "", "error": "capture_failed", "ts": ts_now, "local_only": True},
+                    "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+                    "reminders": self.reminders.list_active(),
+                }
+            prompt = text or "请看看我当前的电脑屏幕画面：如果有报错或问题请直接给解决思路；如果是文档/表格/代码请帮我抓重点；如果是设计或日常画面就用活泼搭子语气聊聊（详细分析放 detail，bubble 给简短回应）。"
+            rep = self.agent_core.chat_with_image_sync(prompt, b64, ctx)
+            _notify_pet(rep.mood, rep.bubble, celebrate=not bool(rep.error))
+            return {
+                "reply": {"mood": rep.mood, "bubble": rep.bubble, "detail": rep.detail, "error": rep.error, "ts": ts_now, "local_only": True},
+                "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+                "reminders": self.reminders.list_active(),
+            }
+
+        if not self.agent_core.has_credentials():
+            return {
+                "reply": {"mood": "focused", "bubble": "还没填 API Key 哦，去「05 引擎与隐私」配好就能开聊啦~", "detail": "", "error": "missing_key", "ts": ts_now, "local_only": True},
+                "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+                "reminders": self.reminders.list_active(),
+            }
+
+        rep = self.agent_core.chat_sync(text, ctx)
+        _notify_pet(
+            rep.mood,
+            rep.bubble,
+            celebrate=(not bool(rep.error) and rep.mood in ("happy", "blink")),
+            tool_action=rep.tool_action if not rep.error else None,
+        )
+        return {
+            "reply": {"mood": rep.mood, "bubble": rep.bubble, "detail": rep.detail, "error": rep.error, "ts": ts_now, "local_only": False},
+            "recent_turns": self.agent_core.memory.get_recent_turns(limit=40),
+            "reminders": self.reminders.list_active(),
+        }
 
     def _chat_bar_status_hint(self) -> str:
         if self.ai_thinking:
@@ -2128,6 +2407,9 @@ class ChibiDesktopPet:
             if isinstance(ov.get("music"), dict):
                 music_snap.update(ov["music"])
         else:
+            # Drain live Control Studio commands on main Win32 UI thread
+            self._drain_studio_commands(now)
+
             # Fire deferred cheek poke if double-click did not arrive within 230ms
             if self._pending_poke_at > 0.0 and now >= self._pending_poke_at:
                 self._pending_poke_at = 0.0
@@ -2516,7 +2798,8 @@ class ChibiDesktopPet:
         # Top companion bond & live weather status header
         user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, self.life_engine.format_menu_summary())
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING, CMD_OPEN_CHAT, f"💬 和开开聊两句 ({self._chat_hotkey_label} / 中键)")
+        user32.AppendMenuW(menu, MF_STRING, CMD_OPEN_AI_SETTINGS, f"🎛️ 打开开开操作中心 ({self._studio_hotkey_label})")
+        user32.AppendMenuW(menu, MF_STRING, CMD_OPEN_CHAT, f"💬 快捷聊天条 ({self._chat_hotkey_label} / 中键)")
         user32.AppendMenuW(menu, MF_STRING, CMD_CLIPBOARD_ASSIST, f"📋 帮我处理剪贴板 ({self._clip_hotkey_label})")
         user32.AppendMenuW(menu, MF_STRING, CMD_INSPECT_SCREEN, "📸 帮我看看当前屏幕")
 
@@ -2529,7 +2812,6 @@ class ChibiDesktopPet:
         if active_rems:
             user32.AppendMenuW(pomo_menu, MF_STRING, CMD_CLEAR_REMINDERS, "🧹 取消全部提醒")
         user32.AppendMenuW(menu, MF_POPUP, pomo_menu, f"⏰ 提醒与番茄钟" + (f"（{len(active_rems)}）" if active_rems else ""))
-        user32.AppendMenuW(menu, MF_STRING, CMD_OPEN_AI_SETTINGS, "⚙️ AI 人设、视觉与记忆设置...")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
 
         if len(self.packs) >= 2:
@@ -2795,7 +3077,7 @@ class ChibiDesktopPet:
         nid.uFlags = NIF_MESSAGE | NIF_TIP | (NIF_ICON if self.hicon else 0)
         nid.uCallbackMessage = WM_TRAYICON
         nid.hIcon = self.hicon or 0
-        nid.szTip = f"{APP_NAME} · 双击换装 / 右键菜单"
+        nid.szTip = f"{APP_NAME} · 操作中心 {self._studio_hotkey_label} / 双击换装"
         shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
 
     def _remove_tray_icon(self) -> None:
@@ -2922,6 +3204,8 @@ class ChibiDesktopPet:
                 self._toggle_chat_bar()
             elif wParam == HOTKEY_ID_CLIPBOARD:
                 self._run_clipboard_assist()
+            elif wParam == HOTKEY_ID_STUDIO:
+                self._open_ai_settings()
             return 0
 
         if msg == WM_CLOSE:
@@ -2936,6 +3220,9 @@ class ChibiDesktopPet:
             if self._clip_hotkey_registered:
                 user32.UnregisterHotKey(hwnd, HOTKEY_ID_CLIPBOARD)
                 self._clip_hotkey_registered = False
+            if self._studio_hotkey_registered:
+                user32.UnregisterHotKey(hwnd, HOTKEY_ID_STUDIO)
+                self._studio_hotkey_registered = False
             if self.chat_bar:
                 self.chat_bar.destroy()
             if self.detail_card:
@@ -3008,6 +3295,16 @@ class ChibiDesktopPet:
         else:
             self._clip_hotkey_registered = False
             self._clip_hotkey_label = "右键菜单"
+
+        if user32.RegisterHotKey(self.hwnd, HOTKEY_ID_STUDIO, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_O):
+            self._studio_hotkey_registered = True
+            self._studio_hotkey_label = "Ctrl+Shift+O"
+        elif user32.RegisterHotKey(self.hwnd, HOTKEY_ID_STUDIO, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_O):
+            self._studio_hotkey_registered = True
+            self._studio_hotkey_label = "Alt+Shift+O"
+        else:
+            self._studio_hotkey_registered = False
+            self._studio_hotkey_label = "右键菜单"
         self.input_monitor.start()
         self.audio_rhythm.start()
 

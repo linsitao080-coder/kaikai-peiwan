@@ -15,8 +15,22 @@
   <img src="docs/previews/music_preview.png" alt="音乐律动飘音符" width="24%" />
   <img src="docs/previews/chat_preview.png" alt="AI 轻聊表情联动" width="24%" />
 </p>
+<p align="center">
+  <img src="docs/previews/studio_light_preview.png" alt="Control Studio 日间暖纸操作中心" width="49%" />
+  <img src="docs/previews/studio_dark_preview.png" alt="Control Studio 夜间深墨操作中心" width="49%" />
+</p>
 
-## ✨ 核心功能（v2.0.0）
+## ✨ 核心功能（v2.1.0）
+
+### 0. 🎛️ 视传级统一操作中心 · Control Studio（`Ctrl + Shift + O` / 右键菜单顶部）
+- **日间暖纸 ↔ 夜间深墨一键切换 + 五皮肤动态联动配色**：采用瑞士 12 列 Bento 网格、纸感微颗粒材质、建筑裁切准星与统一 `1.5px` 线性矢量图标；切换任意一套皮肤时，操作中心整站强调色与立绘展台光晕实时同步变换。
+- **独立无边框桌面应用窗口（零体积膨胀）**：调用 Windows 自带 Edge / Chrome `--app=` 模式以纯净独立桌面窗口居中弹出（DPI 自适应锁定窗口比例，重复呼出自动聚焦不重开），无需打包百兆 Electron。
+- **五大工作区与桌宠 60 FPS 双向联动**：
+  - `01 总览工作台`：实时手绘立绘舞台 + 三栏陪伴 KPI + 快捷动作垫 + 精密刻度缩放滑杆 / 3 档灵敏度 / 置顶与穿透 / 5 枚 LED 模块胶囊；
+  - `02 视觉衣橱与天气`：5 套真实立绘画册一键 Q 弹换装 + 连续温度换装光谱轴 + 内置厦门/泉州等 70+ 国内城市直查；
+  - `03 对话与工具`：多轮长对话流（带实时头像、快捷语与代码/译文一键复制）+ 60 刻度 SVG 环形番茄钟；
+  - `04 人设与记忆`：人设档案卡 + 3 种基调一键切换 + 索引卡式长期记忆库；
+  - `05 引擎与隐私`：双通道信号分流拓扑（主对话 DeepSeek + 独立视觉 `gemini-3-flash-preview` / `glm-4v-flash`）+ 透明隐私边界与机械键帽快捷键一览。
 
 ### 1. 👗 五套精致换装皮肤（双击人物秒切 / 天气自动换装）
 - **🧸 毛绒小熊发箍款（`bear`）** — 暖奶油木色桌板 + 迷你泰迪熊摆件（深夜 23:00 后默认居家睡衣模式）
@@ -55,6 +69,7 @@
 
 | 操作 | 功能 |
 | :--- | :--- |
+| **`Ctrl + Shift + O` / 右键菜单顶部** | 独立应用窗口呼出 **开开操作中心（Control Studio）**（已打开则自动聚焦） |
 | **`Ctrl + Shift + K` / 中键点击桌宠 / 点气泡** | 唤出快捷聊天条（含「剪贴板 / 看屏幕 / 25分番茄 / 定提醒」一键按钮） |
 | **`Ctrl + Shift + T`** | 一键让开开翻译 / 总结 / 排查刚复制的剪贴板内容 |
 | **左键拖拽 / 滚轮缩放** | 自由移动位置 / 平滑放大缩小 |
@@ -106,7 +121,8 @@ kaikai-peiwan/
 │   ├── agent_core.py         # DeepSeek / Gemini / OpenAI 兼容轻聊引擎、视觉分流与三层记忆
 │   ├── agent_tools.py        # 剪贴板安全助手、口语提醒与番茄钟、按需截屏与场景感知
 │   ├── chat_ui.py            # 原生 Win32 快捷聊天条与长回复可复制小纸条
-│   ├── settings_web.py       # 按需启动的本机 127.0.0.1 可视化设置与记忆中心
+│   ├── control_center.py     # 视传级双主题五皮肤联动操作中心（127.0.0.1 + 独立窗口启动）
+│   ├── settings_web.py       # 向后兼容桥接模块（导出 ControlCenterServer）
 │   ├── sprite_processor.py   # 外部洪泛去背与边缘去白边算法
 │   └── build_v5_sprites.py   # 分层透明精灵图包打包与双背景 QA 质检脚本
 ├── assets/
