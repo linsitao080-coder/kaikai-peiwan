@@ -9,14 +9,14 @@ Features:
 - Pixel-aligned drawn keycap LED glow + pastel 3D floating keycap pill ticker (toggleable)
 - Typing-speed-driven facial expressions (Idle/Blink -> Happy -> Focused -> Frantic) + 3 sensitivity presets
 - 60 FPS spring-physics Q-bounce & gentle breathing micro-animation
-- Multi-outfit switcher (Bear Headband / Daily Sky-Blue Jacket / Summer Straw-Hat Lavender)
+- Multi-outfit switcher (Bear Headband / Daily Sky-Blue Jacket / Summer Straw-Hat Lavender / Grey Hoodie Crossbody / Cream Winter Puffer)
 - Smooth drag, scroll-wheel zoom, click-through mode, system tray icon, persistent config.json
 """
 
 from __future__ import annotations
 
 APP_NAME = "开开陪玩"
-APP_VERSION = "1.1.0"
+APP_VERSION = "2.0.0"
 WINDOW_CLASS_NAME = "KaikaiPeiwanPetWindow"
 LEGACY_WINDOW_CLASS_NAME = "ChibiTypingCompanionPetWindowV5"
 
@@ -37,6 +37,23 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from agent_core import AgentCore, ChatReply
+from agent_tools import (
+    ActiveSceneDetector,
+    ReminderScheduler,
+    ToolRegistry,
+    capture_screen_jpeg_b64,
+    classify_clipboard_intent,
+    looks_like_secret,
+    parse_natural_reminder,
+    play_gentle_chime,
+    read_clipboard_text,
+)
+from audio_rhythm import AudioRhythmMonitor
+from chat_ui import DetailNoteCard, FloatingChatBar
+from life_engine import LifeEngine, LifeEvent, OUTFIT_DISPLAY_NAMES, show_city_input_dialog
+from settings_web import LocalSettingsServer
+
 # ---------------------------------------------------------------------------
 # High-DPI awareness (must run before any window creation)
 # ---------------------------------------------------------------------------
@@ -56,10 +73,10 @@ WPARAM = ctypes.c_size_t
 LPARAM = ctypes.c_ssize_t
 ULONG_PTR = ctypes.c_size_t
 
-user32 = ctypes.windll.user32
-gdi32 = ctypes.windll.gdi32
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-shell32 = ctypes.windll.shell32
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 
 WS_POPUP = 0x80000000
 WS_VISIBLE = 0x10000000
@@ -95,8 +112,19 @@ WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
 WM_MOUSEWHEEL = 0x020A
 WM_MOUSELEAVE = 0x02A3
+WM_MBUTTONUP = 0x0208
+WM_HOTKEY = 0x0312
 WM_USER = 0x0400
 WM_TRAYICON = WM_USER + 20
+
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_NOREPEAT = 0x4000
+VK_K = 0x4B
+VK_T = 0x54
+HOTKEY_ID_CHAT = 9001
+HOTKEY_ID_CLIPBOARD = 9002
 
 WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
@@ -118,6 +146,7 @@ NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
 
 MF_STRING = 0x00000000
+MF_GRAYED = 0x00000001
 MF_SEPARATOR = 0x00000800
 MF_CHECKED = 0x00000008
 MF_POPUP = 0x00000010
@@ -138,6 +167,8 @@ CMD_TOGGLE_OUTFIT = 1001
 CMD_OUTFIT_BEAR = 1002
 CMD_OUTFIT_DAILY = 1003
 CMD_OUTFIT_SUMMER = 1008
+CMD_OUTFIT_HOODIE = 1018
+CMD_OUTFIT_PUFFER = 1019
 CMD_CLICK_THROUGH = 1004
 CMD_TOGGLE_HUD = 1005
 CMD_TOGGLE_TOPMOST = 1006
@@ -151,6 +182,22 @@ CMD_SENS_CHILL = 1015
 CMD_SENS_NORMAL = 1016
 CMD_SENS_LIVELY = 1017
 CMD_RESET_POS = 1020
+CMD_TOGGLE_WEATHER = 1021
+CMD_SET_CITY = 1022
+CMD_REFRESH_WEATHER = 1023
+CMD_TOGGLE_MUSIC = 1024
+CMD_TOGGLE_LIFE_CARE = 1025
+CMD_SHOW_STATS = 1026
+CMD_TOGGLE_NIGHT_BEAR = 1027
+CMD_OPEN_CHAT = 1028
+CMD_OPEN_AI_SETTINGS = 1029
+CMD_CLIPBOARD_ASSIST = 1030
+CMD_INSPECT_SCREEN = 1031
+CMD_POMODORO_25 = 1032
+CMD_POMODORO_45 = 1033
+CMD_SHOW_REMINDERS = 1034
+CMD_CLEAR_REMINDERS = 1035
+CMD_TOGGLE_SCENE_AWARE = 1036
 CMD_EXIT = 1099
 
 # ---------------------------------------------------------------------------
@@ -308,6 +355,10 @@ user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, WPARAM, LPARAM]
 user32.PostQuitMessage.argtypes = [ctypes.c_int]
 user32.DestroyWindow.argtypes = [wt.HWND]
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, wt.UINT, wt.UINT]
+user32.RegisterHotKey.restype = wt.BOOL
+user32.UnregisterHotKey.argtypes = [wt.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wt.BOOL
 
 gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
 gdi32.CreateCompatibleDC.restype = wt.HDC
@@ -452,6 +503,7 @@ class GlobalInputMonitor:
         self.last_input_time: float = 0.0
         self.last_kb_time: float = 0.0
         self.last_hit_time: float = 0.0
+        self._pending_key_count: int = 0
 
         self._stop_event = threading.Event()
         self._thread_id: int = 0
@@ -471,6 +523,7 @@ class GlobalInputMonitor:
     def record_key(self, label: str, tray_key: str, kb_pose: str, now: float, duration: float = 0.095) -> None:
         with self._lock:
             self.key_timestamps.append(now)
+            self._pending_key_count += 1
             self.last_input_time = now
             self.last_kb_time = now
             self.last_hit_time = now
@@ -480,6 +533,12 @@ class GlobalInputMonitor:
             # Deduplicate rapid repeat of identical pill within 60ms
             if not self.recent_pills or self.recent_pills[-1][0] != label or (now - self.recent_pills[-1][1]) > 0.07:
                 self.recent_pills.append((label, now))
+
+    def drain_key_count(self) -> int:
+        with self._lock:
+            c = self._pending_key_count
+            self._pending_key_count = 0
+            return c
 
     def record_mouse_click(self, btn: str, now: float) -> None:
         with self._lock:
@@ -601,12 +660,14 @@ MOOD_LABELS = {
     "frantic": "暴走狂敲中!!",
     "doze": "打瞌睡中 Zzz",
     "headpat": "摸摸头好开心~",
+    "music": "跟着节奏摇摆~",
+    "thinking": "正在认真想回复...",
 }
 
-HEADPAT_PHRASES = ("嘿嘿好舒服~", "再摸摸嘛~", "蹭蹭你~", "好开心呀~")
-POKE_MILD_PHRASES = ("干嘛戳我呀~", "脸要被戳扁啦!", "嗯？找我玩嘛~", "好痒呀~")
+HEADPAT_PHRASES = ("嘿嘿好舒服~", "再摸摸嘛搭子~", "蹭蹭你充电中~", "好开心呀~")
+POKE_MILD_PHRASES = ("干嘛戳我呀~", "脸要被戳扁啦!", "嗯？要开黑了嘛~", "好痒呀搭子~")
 POKE_SHY_PHRASES = ("呀别戳啦 >_<", "投降啦投降啦!", "脸都红啦 >_<")
-WELCOME_PHRASES = ("回来啦~", "等你半天啦!", "继续一起加油~")
+WELCOME_PHRASES = ("回来啦搭子~", "等你半天啦!", "继续一起冲呀~")
 
 # Typing speed (keys/sec) thresholds for expression shifts:
 # (happy_up, focused_up, frantic_up, happy_down, focused_down, frantic_down)
@@ -713,7 +774,7 @@ class ChibiDesktopPet:
 
         self.config = self._load_config()
         self.packs: Dict[str, V5OutfitPack] = {}
-        for oid in ("bear", "daily", "summer"):
+        for oid in ("bear", "daily", "summer", "hoodie", "puffer"):
             folder = self.sprites_dir / oid
             if (folder / "layout.json").exists() and (folder / "base.png").exists():
                 self.packs[oid] = V5OutfitPack(oid, folder)
@@ -727,6 +788,38 @@ class ChibiDesktopPet:
         self._ensure_tray_icon()
 
         self.input_monitor = GlobalInputMonitor()
+        self.audio_rhythm = AudioRhythmMonitor()
+        self.audio_rhythm.set_enabled(bool(self.config.get("music_rhythm_enabled", True)))
+        self.life_engine = LifeEngine(self.data_root)
+        self.agent_core = AgentCore(self.data_root)
+        self.reminders = ReminderScheduler(self.data_root / "reminders.json")
+        self.scene_detector = ActiveSceneDetector()
+        self.tool_registry = ToolRegistry()
+        self.tool_registry.register("read_clipboard", "读取剪贴板文本", read_clipboard_text)
+        self.tool_registry.register("create_reminder", "创建定时提醒", self.reminders.add)
+        self.tool_registry.register("inspect_screen", "按需截取当前屏幕", capture_screen_jpeg_b64)
+        self._ai_lock = threading.Lock()
+        self._ai_reply_queue: deque[ChatReply] = deque()
+        self.ai_thinking = False
+        self._bubble_rect = (0, 0, 0, 0)
+        self.chat_bar: Optional[FloatingChatBar] = None
+        self.detail_card: Optional[DetailNoteCard] = None
+        self._hotkey_registered = False
+        self._chat_hotkey_label = "Ctrl+Shift+K"
+        self._clip_hotkey_registered = False
+        self._clip_hotkey_label = "Ctrl+Shift+T"
+        self.settings_server = LocalSettingsServer(
+            agent=self.agent_core,
+            get_life_state=self._get_life_settings_dict,
+            apply_life_update=self._apply_life_settings_update,
+            get_anniversaries=lambda: list(self.life_engine.stats.data.get("anniversaries", [])),
+            save_anniversaries=self._save_anniversaries_from_web,
+            get_reminders=self.reminders.list_active,
+            add_reminder=self._add_reminder_from_web,
+            delete_reminder=self._delete_reminder_from_web,
+        )
+        self._last_music_beat_seq = 0
+        self._next_music_note_at = 0.0
         self.hwnd: Optional[int] = None
         self.hicon: Optional[int] = None
         self._wndproc_ref: Optional[WNDPROC] = None
@@ -824,6 +917,14 @@ class ChibiDesktopPet:
             "mood_sensitivity": "normal",
             "enable_interactions": True,
             "idle_sleep_seconds": 300,
+            "weather_auto_outfit": True,
+            "weather_city": "",
+            "night_bear_mode": True,
+            "music_rhythm_enabled": True,
+            "life_care_enabled": True,
+            "sedentary_minutes": 45,
+            "scene_awareness_enabled": True,
+            "reminder_sound_enabled": True,
         }
         if self.config_path.exists():
             try:
@@ -1049,6 +1150,7 @@ class ChibiDesktopPet:
             was_patting = now < self.headpat_until
             if not was_patting:
                 self._headpat_started_at = now
+                self.life_engine.stats.add_headpat()
             self.headpat_until = now + 1.05
             self._pat_travel *= 0.35
             if now >= self._next_heart_at:
@@ -1072,6 +1174,7 @@ class ChibiDesktopPet:
         if not self._interactions_enabled():
             return
         self._note_user_activity(now)
+        self.life_engine.stats.add_poke()
         dpi = self._dpi_factor()
         if (now - self.last_poke_time) <= 4.5:
             self.poke_combo += 1
@@ -1150,6 +1253,453 @@ class ChibiDesktopPet:
             pts.append((cx + math.cos(ang) * r, cy + math.sin(ang) * r))
         draw.polygon(pts, fill=(color[0], color[1], color[2], alpha), outline=(255, 255, 255, int(alpha * 0.85)))
 
+    def _draw_note_shape(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cx: float,
+        cy: float,
+        size: float,
+        color: Tuple[int, int, int],
+        alpha: int,
+        beamed: bool = False,
+    ) -> None:
+        """Draw a crisp vector musical note (single eighth or beamed double eighth) with white halo."""
+        col = (color[0], color[1], color[2], alpha)
+        halo = (255, 255, 255, int(alpha * 0.90))
+        stem_w = max(2, int(round(size * 0.16)))
+        halo_w = stem_w + 2
+        rx = size * 0.34
+        ry = size * 0.25
+
+        if not beamed:
+            hx, hy = cx - size * 0.12, cy + size * 0.38
+            sx = hx + rx * 0.78
+            sy_top = hy - size * 0.96
+            flag_pts = [
+                (sx, sy_top),
+                (sx + size * 0.44, sy_top + size * 0.22),
+                (sx + size * 0.36, sy_top + size * 0.48),
+            ]
+            # White halo pass
+            draw.ellipse((hx - rx - 1.4, hy - ry - 1.4, hx + rx + 1.4, hy + ry + 1.4), fill=halo)
+            draw.line([(sx, hy), (sx, sy_top)], fill=halo, width=halo_w)
+            draw.line(flag_pts, fill=halo, width=halo_w)
+            # Color pass
+            draw.ellipse((hx - rx, hy - ry, hx + rx, hy + ry), fill=col)
+            draw.line([(sx, hy), (sx, sy_top)], fill=col, width=stem_w)
+            draw.line(flag_pts, fill=col, width=stem_w)
+        else:
+            h1x, h1y = cx - size * 0.42, cy + size * 0.42
+            h2x, h2y = cx + size * 0.28, cy + size * 0.30
+            s1x, s1y = h1x + rx * 0.75, h1y - size * 0.90
+            s2x, s2y = h2x + rx * 0.75, h2y - size * 0.90
+            beam_w = max(3, int(round(size * 0.22)))
+            # Halo pass
+            for hx, hy in ((h1x, h1y), (h2x, h2y)):
+                draw.ellipse((hx - rx - 1.4, hy - ry - 1.4, hx + rx + 1.4, hy + ry + 1.4), fill=halo)
+            draw.line([(s1x, h1y), (s1x, s1y)], fill=halo, width=halo_w)
+            draw.line([(s2x, h2y), (s2x, s2y)], fill=halo, width=halo_w)
+            draw.line([(s1x, s1y), (s2x, s2y)], fill=halo, width=beam_w + 2)
+            # Color pass
+            for hx, hy in ((h1x, h1y), (h2x, h2y)):
+                draw.ellipse((hx - rx, hy - ry, hx + rx, hy + ry), fill=col)
+            draw.line([(s1x, h1y), (s1x, s1y)], fill=col, width=stem_w)
+            draw.line([(s2x, h2y), (s2x, s2y)], fill=col, width=stem_w)
+            draw.line([(s1x, s1y), (s2x, s2y)], fill=col, width=beam_w)
+
+    def _apply_life_event(self, ev: LifeEvent, now: float) -> None:
+        dpi = self._dpi_factor()
+        if ev.outfit and ev.outfit in self.packs and ev.outfit != self.config["outfit"]:
+            self._toggle_outfit(ev.outfit, manual=False)
+        if ev.expr in ("happy", "blink", "focused") and now >= self.headpat_until and self.current_mood != "frantic":
+            self.interact_expr = ev.expr
+            self.interact_expr_until = max(self.interact_expr_until, now + min(3.2, ev.duration))
+        if ev.bubble:
+            self._show_bubble(ev.bubble, now, duration=ev.duration)
+        if ev.burst:
+            sx, sy, sw, sh = self._sprite_rect
+            cx = sx + sw * 0.5
+            cy = sy + sh * 0.20
+            if ev.burst in ("hearts", "celebrate"):
+                for i in range(3):
+                    self._spawn_particle(
+                        "heart",
+                        cx + random.uniform(-sw * 0.26, sw * 0.26),
+                        cy + random.uniform(-6.0, 8.0) * dpi,
+                        now,
+                        vx=random.uniform(-14.0, 14.0) * dpi,
+                        vy=random.uniform(-38.0, -26.0) * dpi,
+                        life=1.45,
+                        size=random.uniform(9.0, 11.5) * dpi,
+                        color=random.choice([(255, 112, 148), (255, 146, 178), (255, 98, 132)]),
+                    )
+            if ev.burst in ("sparkles", "celebrate"):
+                cols = [(255, 204, 78), (126, 206, 255), (255, 142, 184), (196, 150, 255)]
+                for i in range(4):
+                    ang = -math.pi * 0.85 + i * (math.pi * 0.70 / 3.0)
+                    spd = random.uniform(26.0, 44.0) * dpi
+                    self._spawn_particle(
+                        "sparkle",
+                        cx + math.cos(ang) * sw * 0.22,
+                        cy + math.sin(ang) * sh * 0.08,
+                        now,
+                        vx=math.cos(ang) * spd * 0.65,
+                        vy=math.sin(ang) * spd - 12.0 * dpi,
+                        life=1.15,
+                        size=random.uniform(7.5, 10.5) * dpi,
+                        color=cols[i % len(cols)],
+                    )
+            if ev.burst == "celebrate":
+                self.welcome_hop_until = now + 0.34
+
+    # -----------------------------------------------------------------------
+    # Phase 2 AI Companion Chat, Settings Center & Thread-Safe Reply Marshal
+    # -----------------------------------------------------------------------
+    def _get_life_settings_dict(self) -> dict:
+        return {
+            "weather_city": str(self.config.get("weather_city", "")),
+            "sedentary_minutes": int(self.config.get("sedentary_minutes", 45)),
+            "weather_auto_outfit": bool(self.config.get("weather_auto_outfit", True)),
+            "night_bear_mode": bool(self.config.get("night_bear_mode", True)),
+            "music_rhythm_enabled": bool(self.config.get("music_rhythm_enabled", True)),
+            "life_care_enabled": bool(self.config.get("life_care_enabled", True)),
+            "scene_awareness_enabled": bool(self.config.get("scene_awareness_enabled", True)),
+            "reminder_sound_enabled": bool(self.config.get("reminder_sound_enabled", True)),
+        }
+
+    def _apply_life_settings_update(self, patch: dict) -> None:
+        if "weather_city" in patch:
+            self.config["weather_city"] = str(patch["weather_city"]).strip()
+        if "sedentary_minutes" in patch:
+            try:
+                self.config["sedentary_minutes"] = max(10, min(180, int(patch["sedentary_minutes"])))
+            except Exception:
+                pass
+        for key in (
+            "weather_auto_outfit",
+            "night_bear_mode",
+            "music_rhythm_enabled",
+            "life_care_enabled",
+            "scene_awareness_enabled",
+            "reminder_sound_enabled",
+        ):
+            if key in patch:
+                self.config[key] = bool(patch[key])
+        self.audio_rhythm.set_enabled(bool(self.config.get("music_rhythm_enabled", True)))
+        self._save_config()
+        if "weather_city" in patch or "weather_auto_outfit" in patch or "night_bear_mode" in patch:
+            self.life_engine.request_weather_refresh(
+                str(self.config.get("weather_city", "")),
+                available_packs=self.packs.keys(),
+                auto_outfit=bool(self.config.get("weather_auto_outfit", True)),
+                night_bear_mode=bool(self.config.get("night_bear_mode", True)),
+                force_outfit=True,
+                announce=True,
+            )
+
+    def _save_anniversaries_from_web(self, items: list) -> None:
+        self.life_engine.stats.data["anniversaries"] = items
+        self.life_engine.stats.save(force=True)
+
+    def _add_reminder_from_web(self, kind: str, minutes: int, title: str) -> list:
+        self.reminders.add(title=title, delay_secs=minutes * 60.0, kind=kind)
+        return self.reminders.list_active()
+
+    def _delete_reminder_from_web(self, rid: str) -> list:
+        self.reminders.cancel(rid)
+        return self.reminders.list_active()
+
+    def _get_runtime_context(self) -> dict:
+        w = self.life_engine.last_weather
+        return {
+            "outfit_name": OUTFIT_DISPLAY_NAMES.get(self.config.get("outfit", "bear"), ""),
+            "weather_text": f"{w.city} {round(w.temp_c)}°C {w.desc_zh}" if w else "",
+            "scene_label": self.scene_detector.get_scene_label() if self.config.get("scene_awareness_enabled", True) else "",
+            "days_accompanied": int(self.life_engine.stats.data.get("days_accompanied", 1)),
+            "today_keys": int(self.life_engine.stats.data.get("today_keys", 0)),
+        }
+
+    def _ensure_chat_windows(self) -> None:
+        dpi = self._dpi_factor()
+        if self.chat_bar is None:
+            self.chat_bar = FloatingChatBar(
+                parent_hwnd=self.hwnd or 0,
+                dpi=dpi,
+                on_send=self._on_chat_send,
+                on_open_settings=self._open_ai_settings,
+                on_clipboard=self._run_clipboard_assist,
+                on_screen=self._run_screen_inspect,
+                on_pomodoro=lambda: self._start_pomodoro(25, "专注时间"),
+            )
+        if self.detail_card is None:
+            self.detail_card = DetailNoteCard(
+                parent_hwnd=self.hwnd or 0,
+                dpi=dpi,
+                on_continue_chat=self._open_chat_bar,
+            )
+
+    def _open_ai_settings(self) -> None:
+        self.settings_server.open_in_browser()
+
+    def _chat_bar_status_hint(self) -> str:
+        if self.ai_thinking:
+            return "开开正在敲键盘想回复..."
+        if not self.agent_core.has_credentials():
+            return "还没填 API Key 哦，点右侧「设置」10 秒配好~"
+        cfg = self.agent_core.get_config()
+        return f"模型：{cfg.get('model') or 'deepseek-chat'} · Enter 发送 / {self._clip_hotkey_label} 读剪贴板"
+
+    def _open_chat_bar(self) -> None:
+        self._ensure_chat_windows()
+        if self.chat_bar:
+            self.chat_bar.show_near((self.win_x, self.win_y, self.canvas_w, self.canvas_h), self._chat_bar_status_hint())
+
+    def _toggle_chat_bar(self) -> None:
+        self._ensure_chat_windows()
+        if self.chat_bar:
+            self.chat_bar.toggle_near((self.win_x, self.win_y, self.canvas_w, self.canvas_h), self._chat_bar_status_hint())
+
+    def _burst_celebrate_particles(self, now: float, hearts: bool = True) -> None:
+        dpi = self._dpi_factor()
+        sx, sy, sw, sh = self._sprite_rect
+        cols = [(255, 204, 78), (255, 134, 168), (126, 206, 255), (196, 150, 255)]
+        for i in range(4):
+            self._spawn_particle(
+                "sparkle",
+                sx + sw * (0.24 + i * 0.17),
+                sy + sh * 0.16,
+                now,
+                vx=random.uniform(-18.0, 18.0) * dpi,
+                vy=random.uniform(-34.0, -22.0) * dpi,
+                life=1.15,
+                size=random.uniform(7.5, 10.5) * dpi,
+                color=cols[i % len(cols)],
+            )
+        if hearts:
+            self._spawn_particle(
+                "heart",
+                sx + sw * 0.65,
+                sy + sh * 0.14,
+                now,
+                vx=random.uniform(-8.0, 12.0) * dpi,
+                vy=-34.0 * dpi,
+                life=1.4,
+                size=10.5 * dpi,
+                color=(255, 118, 152),
+            )
+
+    def _start_pomodoro(self, minutes: int = 25, label: str = "专注时间") -> None:
+        now = time.perf_counter()
+        self._note_user_activity(now)
+        rec = self.reminders.add(title=label, delay_secs=minutes * 60.0, kind="pomodoro")
+        self.interact_expr = "happy"
+        self.interact_expr_until = now + 3.6
+        self.welcome_hop_until = now + 0.28
+        self._burst_celebrate_particles(now, hearts=False)
+        self._show_bubble(f"{minutes}分钟番茄钟开跑！预计 {rec['due_label']} 喊你歇会~", now, duration=4.4)
+        if self.chat_bar:
+            self.chat_bar.set_status(f"番茄钟计时中（预计 {rec['due_label']} 结束）")
+
+    def _run_clipboard_assist(self, custom_instruction: str = "") -> None:
+        now = time.perf_counter()
+        self._note_user_activity(now)
+        if not self.agent_core.has_credentials():
+            self._show_bubble("还没配 API Key 哦，点「设置」配好就能帮你读剪贴板~", now, duration=4.2)
+            return
+        if self.ai_thinking:
+            return
+        clip_txt, err = read_clipboard_text()
+        if err or not clip_txt:
+            self._show_bubble(err or "剪贴板里没文字哦~", now, duration=3.5)
+            return
+        if looks_like_secret(clip_txt):
+            self.interact_expr = "focused"
+            self.interact_expr_until = now + 3.5
+            self._show_bubble("这段看着像密钥或密码，为了安全我就不发给 AI 啦~", now, duration=4.4)
+            return
+
+        intent, auto_prompt = classify_clipboard_intent(clip_txt)
+        if custom_instruction.strip():
+            prompt = (
+                f"用户的要求：{custom_instruction.strip()}\n"
+                f"用户剪贴板里的内容（完整结果请放 detail 字段，bubble 给一句简短回应）：\n\n{clip_txt}"
+            )
+            thinking_txt = "收到！正在帮你处理剪贴板..."
+        else:
+            prompt = auto_prompt
+            thinking_txt = {
+                "code_error": "看到一段报错，我帮你瞄一眼原因...",
+                "translate_en": "收到英文段落，马上帮你翻译...",
+                "summarize": "字挺多呀，我帮你提炼重点...",
+            }.get(intent, "收到剪贴板内容，容我瞄两眼...")
+
+        self.ai_thinking = True
+        self._show_bubble(thinking_txt, now, duration=30.0)
+        if self.chat_bar:
+            self.chat_bar.set_busy(True)
+            self.chat_bar.set_status(thinking_txt)
+
+        ctx = self._get_runtime_context()
+
+        def on_done(reply: ChatReply) -> None:
+            with self._ai_lock:
+                self._ai_reply_queue.append(reply)
+
+        if not self.agent_core.chat_async(prompt, ctx, on_done, save_to_memory=False):
+            self.ai_thinking = False
+            if self.chat_bar:
+                self.chat_bar.set_busy(False)
+
+    def _run_screen_inspect(self, user_prompt: str = "") -> None:
+        now = time.perf_counter()
+        self._note_user_activity(now)
+        if self.ai_thinking:
+            return
+        v_cfg, v_err = self.agent_core.resolve_vision_config()
+        if not v_cfg:
+            self.interact_expr = "focused"
+            self.interact_expr_until = now + 4.2
+            self._show_bubble("当前主模型是纯文本哦，可在设置里配独立视觉模型看屏~", now, duration=4.6)
+            self._ensure_chat_windows()
+            if self.detail_card:
+                self.detail_card.show_note(
+                    v_err + "\n\n小提示：点右键 →「AI 人设、视觉与记忆设置」→「独立视觉模型分流」，支持智谱 glm-4v-flash / 通义千问 VL / Gemini Vision。",
+                    (self.win_x, self.win_y, self.canvas_w, self.canvas_h),
+                    title="👁️ 视觉看屏设置引导",
+                )
+            return
+
+        if self.chat_bar:
+            self.chat_bar.hide()
+        b64, _sz, cap_err = capture_screen_jpeg_b64()
+        if cap_err or not b64:
+            self._show_bubble(cap_err or "截屏没成功，再试一次吧~", now, duration=3.8)
+            return
+
+        self.ai_thinking = True
+        self._show_bubble("咔嚓！我瞄一眼你的屏幕哦...", now, duration=35.0)
+        if self.chat_bar:
+            self.chat_bar.set_busy(True)
+            self.chat_bar.set_status("正在用视觉模型看你的屏幕...")
+
+        prompt = (
+            user_prompt.strip()
+            if user_prompt.strip()
+            else "请看看我当前的电脑屏幕画面：如果有报错或问题请直接给解决思路；如果是文档/表格/代码请帮我抓重点；如果是游戏或日常画面就用活泼搭子的语气聊聊（详细分析放 detail，bubble 写一句简短精炼的话）。"
+        )
+        ctx = self._get_runtime_context()
+
+        def on_done(reply: ChatReply) -> None:
+            with self._ai_lock:
+                self._ai_reply_queue.append(reply)
+
+        if not self.agent_core.chat_with_image_async(prompt, b64, ctx, on_done):
+            self.ai_thinking = False
+            if self.chat_bar:
+                self.chat_bar.set_busy(False)
+
+    def _execute_tool_action(self, action: dict, now: float) -> None:
+        name = str(action.get("name") or "").strip().lower()
+        if name == "create_reminder":
+            mins = max(1, min(1440, int(action.get("minutes") or 15)))
+            title = str(action.get("title") or "到点啦").strip()
+            self.reminders.add(title=title, delay_secs=mins * 60.0, kind="reminder")
+        elif name == "start_pomodoro":
+            mins = max(1, min(180, int(action.get("minutes") or 25)))
+            label = str(action.get("label") or "专注时间").strip()
+            self.reminders.add(title=label, delay_secs=mins * 60.0, kind="pomodoro")
+        elif name == "read_clipboard":
+            self._run_clipboard_assist()
+
+    def _on_chat_send(self, user_text: str) -> None:
+        now = time.perf_counter()
+        self._note_user_activity(now)
+
+        # 1. Instant local natural-language Reminder / Pomodoro handling (zero latency, works offline!)
+        rem_intent = parse_natural_reminder(user_text)
+        if rem_intent is not None:
+            rec = self.reminders.add(title=rem_intent.title, delay_secs=rem_intent.delay_secs, kind=rem_intent.kind)
+            self.interact_expr = "happy"
+            self.interact_expr_until = now + 3.8
+            self.welcome_hop_until = now + 0.28
+            self._burst_celebrate_particles(now, hearts=False)
+            if rem_intent.kind == "pomodoro":
+                msg = f"好嘞！{rec['duration_mins']}分钟番茄钟开跑，{rec['due_label']} 喊你休息~"
+            else:
+                msg = f"记下啦！{rec['due_label']} 准时喊你「{rec['title']}」~"
+            self._show_bubble(msg, now, duration=4.6)
+            if self.chat_bar:
+                self.chat_bar.set_status(msg)
+            return
+
+        # 2. Explicit clipboard or screen inspection phrasing
+        if any(k in user_text for k in ("剪贴板", "刚复制", "复制的内容", "粘贴板")):
+            self._run_clipboard_assist(custom_instruction=user_text)
+            return
+        if any(k in user_text for k in ("看看屏幕", "看看我屏幕", "看下屏幕", "看我屏幕", "截屏看看")):
+            self._run_screen_inspect(user_prompt=user_text)
+            return
+
+        if not self.agent_core.has_credentials():
+            self._show_bubble("还没配 API Key 哦，点「设置」填一下就能开聊~", now, duration=4.2)
+            if self.chat_bar:
+                self.chat_bar.set_status("请点右侧「设置」填写 API Key")
+            return
+        if self.ai_thinking:
+            return
+        self.ai_thinking = True
+        self._show_bubble("收到！容我想两秒...", now, duration=28.0)
+        if self.chat_bar:
+            self.chat_bar.set_busy(True)
+            self.chat_bar.set_status("开开正在敲键盘想回复...")
+
+        ctx = self._get_runtime_context()
+
+        def on_done(reply: ChatReply) -> None:
+            with self._ai_lock:
+                self._ai_reply_queue.append(reply)
+
+        started = self.agent_core.chat_async(user_text, ctx, on_done)
+        if not started:
+            self.ai_thinking = False
+            if self.chat_bar:
+                self.chat_bar.set_busy(False)
+
+    def _consume_ai_reply(self, reply: ChatReply, now: float) -> None:
+        self.ai_thinking = False
+        if self.chat_bar:
+            self.chat_bar.set_busy(False)
+            if reply.error:
+                self.chat_bar.set_status("回复失败，点「设置」检查 Key 或网络")
+            else:
+                self.chat_bar.set_status(self._chat_bar_status_hint())
+
+        mood = reply.mood if reply.mood in ("idle", "happy", "focused", "frantic", "blink") else "happy"
+        self.interact_expr = mood
+        self.interact_expr_until = now + 4.8
+        dur = 5.2 if len(reply.bubble) > 16 else 4.2
+        self._show_bubble(reply.bubble, now, duration=dur)
+
+        if not reply.error and mood in ("happy", "blink"):
+            self.welcome_hop_until = now + 0.28
+            self._burst_celebrate_particles(now, hearts=False)
+
+        if reply.tool_action and not reply.error:
+            try:
+                self._execute_tool_action(reply.tool_action, now)
+            except Exception:
+                pass
+
+        if reply.detail:
+            self._ensure_chat_windows()
+            if self.detail_card:
+                pet_name = str((self.agent_core.get_config().get("persona") or {}).get("pet_name") or "开开")
+                self.detail_card.show_note(
+                    reply.detail,
+                    (self.win_x, self.win_y, self.canvas_w, self.canvas_h),
+                    title=f"💬 {pet_name}的小纸条",
+                )
+
     def _draw_particles(self, canvas: Image.Image, now: float, static_particles: Optional[List[dict]] = None) -> Image.Image:
         items = static_particles if static_particles is not None else self.particles
         if not items:
@@ -1188,6 +1738,9 @@ class ChibiDesktopPet:
             elif kind == "sparkle":
                 sc = math.sin(min(1.0, prog) * math.pi)
                 self._draw_sparkle_shape(draw, px, py, max(2.5, p["size"] * sc), p["color"], alpha)
+            elif kind == "note":
+                sc = 0.76 + 0.32 * min(1.0, prog / 0.22)
+                self._draw_note_shape(draw, px, py, p["size"] * sc, p["color"], alpha, beamed=(p.get("text") == "double"))
             elif kind == "zzz":
                 txt = p.get("text") or "Z"
                 font = self._zzz_font_lg if txt == "Z" else self._zzz_font_sm
@@ -1200,6 +1753,42 @@ class ChibiDesktopPet:
         if static_particles is None:
             self.particles = alive
         return Image.alpha_composite(canvas, layer)
+
+    def _wrap_bubble_lines(self, draw: ImageDraw.ImageDraw, text: str, max_w: int) -> List[str]:
+        """Wrap CJK/ASCII bubble text cleanly into up to 3 lines so long quips never clip."""
+        lines: List[str] = []
+        for para in text.splitlines() or [text]:
+            cur = ""
+            for ch in para:
+                cand = cur + ch
+                bb = draw.textbbox((0, 0), cand, font=self._bubble_font)
+                if cur and (bb[2] - bb[0]) > max_w:
+                    lines.append(cur)
+                    cur = ch
+                    if len(lines) >= 2:
+                        # Remaining text goes on line 3 (ellipsis if still too long)
+                        break
+                else:
+                    cur = cand
+            if cur:
+                lines.append(cur)
+        if len(lines) > 3:
+            lines = lines[:3]
+        # Avoid ugly dangling 1-char punctuation (like lone "~" or "！") on the final line
+        if len(lines) >= 2 and len(lines[-1]) <= 2 and all(ch in "~～!！。？?…,.，、" for ch in lines[-1]):
+            if len(lines[-2]) >= 4:
+                lines[-1] = lines[-2][-2:] + lines[-1]
+                lines[-2] = lines[-2][:-2]
+        if lines:
+            last = lines[-1]
+            while len(last) > 2:
+                bb = draw.textbbox((0, 0), last, font=self._bubble_font)
+                if (bb[2] - bb[0]) <= max_w:
+                    break
+                last = last[:-1]
+            if last != lines[-1]:
+                lines[-1] = last[:-1] + "…"
+        return lines or [text]
 
     def _draw_reaction_bubble(
         self,
@@ -1232,24 +1821,38 @@ class ChibiDesktopPet:
         bd_c = theme["pill_border_rgba"]
         tx_c = theme["pill_text_rgba"]
 
-        bbox = draw.textbbox((0, 0), text, font=self._bubble_font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
         pad_x = int(round(12 * dpi))
         pad_y = int(round(6 * dpi))
+        line_gap = int(round(3 * dpi))
+        max_text_w = max(80, self.canvas_w - pad_x * 2 - int(round(16 * dpi)))
+        lines = self._wrap_bubble_lines(draw, text, max_text_w)
+
+        line_metrics = []
+        tw = 0
+        th = 0
+        for idx, ln in enumerate(lines):
+            bb = draw.textbbox((0, 0), ln, font=self._bubble_font)
+            lw = bb[2] - bb[0]
+            lh = bb[3] - bb[1]
+            line_metrics.append((ln, lw, lh, bb))
+            tw = max(tw, lw)
+            th += lh + (line_gap if idx > 0 else 0)
+
         bw = tw + pad_x * 2
         bh = th + pad_y * 2
         tail_h = int(round(7 * dpi))
+        radius = min(bh // 2, int(round(14 * dpi)))
 
         bx1 = max(6, min(self.canvas_w - bw - 6, (self.canvas_w - bw) // 2))
         sx, sy, sw, _ = self._sprite_rect
-        by1 = max(6, sy - bh - tail_h - int(round(4 * dpi)) + pop_y)
+        by1 = max(4, sy - bh - tail_h - int(round(4 * dpi)) + pop_y)
+        self._bubble_rect = (bx1, by1, bx1 + bw, by1 + bh)
 
         # Soft drop shadow
         sh_a = int(52 * fade)
         draw.rounded_rectangle(
             (bx1 + 1, by1 + int(round(2 * dpi)), bx1 + bw + 1, by1 + bh + int(round(2 * dpi))),
-            radius=bh // 2,
+            radius=radius,
             fill=(40, 32, 48, sh_a),
         )
 
@@ -1270,7 +1873,7 @@ class ChibiDesktopPet:
         # Rounded speech bubble body (drawn over top seam of pointer triangle)
         draw.rounded_rectangle(
             (bx1, by1, bx1 + bw, by1 + bh),
-            radius=bh // 2,
+            radius=radius,
             fill=fill_col,
             outline=border_col,
             width=bw_line,
@@ -1282,9 +1885,12 @@ class ChibiDesktopPet:
             width=bw_line + 1,
         )
 
-        tx = bx1 + (bw - tw) // 2 - bbox[0]
-        ty = by1 + (bh - th) // 2 - bbox[1] - 1
-        draw.text((tx, ty), text, font=self._bubble_font, fill=(tx_c[0], tx_c[1], tx_c[2], int(255 * fade)))
+        cur_y = by1 + pad_y
+        for ln, lw, lh, bb in line_metrics:
+            tx = bx1 + (bw - lw) // 2 - bb[0]
+            ty = cur_y - bb[1] - 1
+            draw.text((tx, ty), ln, font=self._bubble_font, fill=(tx_c[0], tx_c[1], tx_c[2], int(255 * fade)))
+            cur_y += lh + line_gap
         return Image.alpha_composite(canvas, layer)
 
     def _compute_mood(self, now: float, raw_kps: float, idle_secs: float) -> str:
@@ -1493,6 +2099,15 @@ class ChibiDesktopPet:
         ov_bubble: Optional[Tuple[str, float, float]] = None
         is_headpat = False
         is_dozing_now = False
+        music_snap = {
+            "dancing": False,
+            "energy": 0.0,
+            "sway_x": 0.0,
+            "bob_y": 0.0,
+            "squash": 0.0,
+            "beat_seq": 0,
+            "peak": 0.0,
+        }
 
         if self._verify_override is not None:
             ov = self._verify_override
@@ -1510,11 +2125,17 @@ class ChibiDesktopPet:
             is_dozing_now = bool(ov.get("dozing", False))
             static_particles = ov.get("particles")
             ov_bubble = ov.get("bubble")
+            if isinstance(ov.get("music"), dict):
+                music_snap.update(ov["music"])
         else:
             # Fire deferred cheek poke if double-click did not arrive within 230ms
             if self._pending_poke_at > 0.0 and now >= self._pending_poke_at:
                 self._pending_poke_at = 0.0
                 self._trigger_cheek_poke(now, self._pending_poke_pos[0], self._pending_poke_pos[1])
+
+            key_delta = self.input_monitor.drain_key_count()
+            if key_delta > 0:
+                self.life_engine.stats.add_keys(key_delta)
 
             snap = self.input_monitor.get_snapshot(now)
             kps = snap["kps"]
@@ -1531,14 +2152,98 @@ class ChibiDesktopPet:
             show_hud_force = False
             mood_for_hud = self.current_mood
 
+            # WASAPI system music rhythm monitor
+            if self.config.get("music_rhythm_enabled", True):
+                music_snap = self.audio_rhythm.get_snapshot(dpi)
+
             # Idle doze check (default 300s of total inactivity)
             sleep_secs = max(30.0, float(self.config.get("idle_sleep_seconds", 300)))
             if self._interactions_enabled() and not self.dragging:
-                if (now - self.last_activity_at) >= sleep_secs:
+                if (now - self.last_activity_at) >= sleep_secs and not music_snap["dancing"]:
                     if not self.is_dozing:
                         self.is_dozing = True
                         self._next_zzz_at = now + 0.15
                 is_dozing_now = self.is_dozing
+
+            # Drain completed async AI replies on the main Win32 UI thread
+            while True:
+                with self._ai_lock:
+                    rep = self._ai_reply_queue.popleft() if self._ai_reply_queue else None
+                if rep is None:
+                    break
+                self._consume_ai_reply(rep, now)
+
+            # Poll due local reminders & Pomodoro completions
+            for rem in self.reminders.poll_due():
+                self.interact_expr = "happy"
+                self.interact_expr_until = now + 5.0
+                self.welcome_hop_until = now + 0.34
+                self._burst_celebrate_particles(now, hearts=True)
+                if rem.get("kind") == "pomodoro":
+                    self._show_bubble(
+                        f"{rem.get('duration_mins', 25)}分钟番茄钟完成！休息两分钟吧~",
+                        now,
+                        duration=6.0,
+                    )
+                else:
+                    self._show_bubble(f"到点啦！记得：{rem.get('title', '休息一下')}~", now, duration=6.0)
+                if self.config.get("reminder_sound_enabled", True):
+                    play_gentle_chime()
+
+            # Gentle privacy-first active scene awareness (exe basename only, >=20 min cooldown)
+            scene_quip = self.scene_detector.poll(
+                now,
+                enabled=bool(self.config.get("scene_awareness_enabled", True)),
+                is_dozing=is_dozing_now,
+            )
+            if scene_quip and not self.ai_thinking and now >= self.bubble_until and kps < 1.5:
+                self.interact_expr = "happy"
+                self.interact_expr_until = now + 3.2
+                self._show_bubble(scene_quip, now, duration=4.4)
+
+            # Local LifeEngine events (weather auto-outfit, buddy greetings, sedentary care, anniversary)
+            for ev in self.life_engine.poll(
+                now=now,
+                idle_secs=snap["idle_secs"],
+                is_dozing=is_dozing_now,
+                is_dancing=music_snap["dancing"],
+                config=self.config,
+                available_packs=self.packs.keys(),
+            ):
+                self._apply_life_event(ev, now)
+
+            # Cute "typing back a reply" micro-animation while AI is thinking
+            if self.ai_thinking and not is_dozing_now:
+                expr = "focused"
+                mood_for_hud = "thinking"
+                step_idx = int((now * 7.0) % 4)
+                kb_pose = ("up", "high", "mid", "low")[step_idx]
+                glow_keys = {("S", "D", "A", "F")[step_idx]: 0.72}
+
+            # Spawn floating musical notes on strong music beats when dancing
+            if music_snap["dancing"] and not is_dozing_now and not self.dragging:
+                bseq = music_snap["beat_seq"]
+                if bseq != self._last_music_beat_seq:
+                    self._last_music_beat_seq = bseq
+                    if now >= self._next_music_note_at:
+                        self._next_music_note_at = now + 0.72
+                        sx0, sy0, sw0, sh0 = self._sprite_rect
+                        side = -1.0 if random.random() < 0.5 else 1.0
+                        note_cols = [(255, 118, 162), (104, 188, 255), (255, 194, 72), (186, 134, 255)]
+                        self._spawn_particle(
+                            "note",
+                            sx0 + sw0 * (0.50 + side * random.uniform(0.22, 0.34)),
+                            sy0 + sh0 * random.uniform(0.18, 0.30),
+                            now,
+                            vx=side * random.uniform(8.0, 18.0) * dpi,
+                            vy=random.uniform(-34.0, -24.0) * dpi,
+                            life=1.55,
+                            size=random.uniform(10.5, 13.5) * dpi,
+                            color=random.choice(note_cols),
+                            text="double" if random.random() < 0.45 else "single",
+                        )
+                if mood_for_hud == "idle":
+                    mood_for_hud = "music"
 
             # Priority expression overrides: Headpat > Cheek Poke / Welcome Back > Idle Doze > Typing Mood
             if now < self.headpat_until:
@@ -1635,6 +2340,11 @@ class ChibiDesktopPet:
             offset_y -= 2.5 * dpi
         else:
             self._drag_sway *= 0.75
+            if music_snap["dancing"] and not is_dozing_now and not is_headpat:
+                shake_x += music_snap["sway_x"]
+                offset_y += music_snap["bob_y"]
+                sx += music_snap["squash"]
+                sy -= music_snap["squash"] * 0.85
 
         if now < self.outfit_pop_until:
             pop_p = 1.0 - (self.outfit_pop_until - now) / 0.24
@@ -1664,6 +2374,8 @@ class ChibiDesktopPet:
             canvas = self._draw_reaction_bubble(
                 canvas, pack, self.bubble_text, now - self.bubble_start_at, self.bubble_until - self.bubble_start_at
             )
+        else:
+            self._bubble_rect = (0, 0, 0, 0)
 
         # Floating pastel mechanical keycap pills (shows exact keys pressed!)
         if self.config.get("show_keycaps", True) and pills:
@@ -1751,7 +2463,7 @@ class ChibiDesktopPet:
         gdi32.DeleteDC(mem_dc)
         user32.ReleaseDC(None, screen_dc)
 
-    def _toggle_outfit(self, target: Optional[str] = None) -> None:
+    def _toggle_outfit(self, target: Optional[str] = None, manual: bool = True) -> None:
         keys = list(self.packs.keys())
         if len(keys) <= 1:
             return
@@ -1760,6 +2472,8 @@ class ChibiDesktopPet:
         else:
             idx = keys.index(self.config["outfit"])
             self.config["outfit"] = keys[(idx + 1) % len(keys)]
+        if manual:
+            self.life_engine.stats.mark_manual_outfit()
         self.outfit_pop_until = time.perf_counter() + 0.24
         self._recompute_canvas_size()
         self._save_config()
@@ -1799,12 +2513,33 @@ class ChibiDesktopPet:
             return
         menu = user32.CreatePopupMenu()
 
+        # Top companion bond & live weather status header
+        user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, self.life_engine.format_menu_summary())
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(menu, MF_STRING, CMD_OPEN_CHAT, f"💬 和开开聊两句 ({self._chat_hotkey_label} / 中键)")
+        user32.AppendMenuW(menu, MF_STRING, CMD_CLIPBOARD_ASSIST, f"📋 帮我处理剪贴板 ({self._clip_hotkey_label})")
+        user32.AppendMenuW(menu, MF_STRING, CMD_INSPECT_SCREEN, "📸 帮我看看当前屏幕")
+
+        pomo_menu = user32.CreatePopupMenu()
+        active_rems = self.reminders.list_active()
+        user32.AppendMenuW(pomo_menu, MF_STRING, CMD_POMODORO_25, "🍅 开始 25 分钟番茄钟")
+        user32.AppendMenuW(pomo_menu, MF_STRING, CMD_POMODORO_45, "🍅 开始 45 分钟深度番茄钟")
+        user32.AppendMenuW(pomo_menu, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(pomo_menu, MF_STRING, CMD_SHOW_REMINDERS, f"📋 查看当前提醒（{len(active_rems)} 项）...")
+        if active_rems:
+            user32.AppendMenuW(pomo_menu, MF_STRING, CMD_CLEAR_REMINDERS, "🧹 取消全部提醒")
+        user32.AppendMenuW(menu, MF_POPUP, pomo_menu, f"⏰ 提醒与番茄钟" + (f"（{len(active_rems)}）" if active_rems else ""))
+        user32.AppendMenuW(menu, MF_STRING, CMD_OPEN_AI_SETTINGS, "⚙️ AI 人设、视觉与记忆设置...")
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+
         if len(self.packs) >= 2:
             cur = self.config["outfit"]
             outfit_menu_items = [
                 ("bear", CMD_OUTFIT_BEAR, "🧸 毛绒小熊发箍款"),
                 ("daily", CMD_OUTFIT_DAILY, "🩵 日常浅蓝外套款"),
                 ("summer", CMD_OUTFIT_SUMMER, "👒 夏日草帽香芋紫款"),
+                ("hoodie", CMD_OUTFIT_HOODIE, "🩶 灰色卫衣斜挎包款"),
+                ("puffer", CMD_OUTFIT_PUFFER, "❄️ 奶白羽绒服冬日款"),
             ]
             for oid, cmd_id, label in outfit_menu_items:
                 if oid in self.packs:
@@ -1813,6 +2548,36 @@ class ChibiDesktopPet:
                         cmd_id, label,
                     )
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+
+        life_menu = user32.CreatePopupMenu()
+        city_cur = str(self.config.get("weather_city", "")).strip()
+        city_label = f"📍 设置天气城市（当前：{city_cur or '自动定位'}）..."
+        user32.AppendMenuW(
+            life_menu, MF_STRING | (MF_CHECKED if self.config.get("weather_auto_outfit", True) else 0),
+            CMD_TOGGLE_WEATHER, "🌤️ 按天气自动换装",
+        )
+        user32.AppendMenuW(
+            life_menu, MF_STRING | (MF_CHECKED if self.config.get("night_bear_mode", True) else 0),
+            CMD_TOGGLE_NIGHT_BEAR, "🌙 深夜自动换居家小熊款",
+        )
+        user32.AppendMenuW(life_menu, MF_STRING, CMD_SET_CITY, city_label)
+        user32.AppendMenuW(life_menu, MF_STRING, CMD_REFRESH_WEATHER, "🔄 立即刷新天气并换装")
+        user32.AppendMenuW(life_menu, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(
+            life_menu, MF_STRING | (MF_CHECKED if self.config.get("music_rhythm_enabled", True) else 0),
+            CMD_TOGGLE_MUSIC, "🎵 音乐律动陪玩（随音乐摇摆飘音符）",
+        )
+        user32.AppendMenuW(
+            life_menu, MF_STRING | (MF_CHECKED if self.config.get("life_care_enabled", True) else 0),
+            CMD_TOGGLE_LIFE_CARE, "⏰ 作息问候与久坐护眼提醒",
+        )
+        user32.AppendMenuW(
+            life_menu, MF_STRING | (MF_CHECKED if self.config.get("scene_awareness_enabled", True) else 0),
+            CMD_TOGGLE_SCENE_AWARE, "👀 温和场景感知（仅本地大类）",
+        )
+        user32.AppendMenuW(life_menu, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(life_menu, MF_STRING, CMD_SHOW_STATS, "📊 查看陪伴小档案...")
+        user32.AppendMenuW(menu, MF_POPUP, life_menu, "🌈 陪伴与天气设置")
 
         scale_menu = user32.CreatePopupMenu()
         sc = self.config["scale"]
@@ -1872,14 +2637,106 @@ class ChibiDesktopPet:
         self._handle_command(cmd)
 
     def _handle_command(self, cmd: int) -> None:
-        if cmd == CMD_OUTFIT_BEAR:
+        if cmd == CMD_OPEN_CHAT:
+            self._open_chat_bar()
+        elif cmd == CMD_OPEN_AI_SETTINGS:
+            self._open_ai_settings()
+        elif cmd == CMD_CLIPBOARD_ASSIST:
+            self._run_clipboard_assist()
+        elif cmd == CMD_INSPECT_SCREEN:
+            self._run_screen_inspect()
+        elif cmd == CMD_POMODORO_25:
+            self._start_pomodoro(25, "25分钟专注")
+        elif cmd == CMD_POMODORO_45:
+            self._start_pomodoro(45, "45分钟深度专注")
+        elif cmd == CMD_SHOW_REMINDERS:
+            rems = self.reminders.list_active()
+            if not rems:
+                body = "当前没有待触发的提醒哦~\n\n在聊天条里直接说「30分钟后提醒我拿快递」或「开个25分钟番茄钟」就能定闹钟！"
+            else:
+                lines = []
+                for r in rems:
+                    tag = "🍅 番茄钟" if r["kind"] == "pomodoro" else "⏰ 提醒"
+                    rem_m = max(1, int(round(r["remaining_secs"] / 60.0)))
+                    lines.append(f"• {tag}：{r['title']}（预计 {r['due_label']}，剩约 {rem_m} 分钟）")
+                body = "\n".join(lines)
+            user32.MessageBoxW(self.hwnd or None, body, f"{APP_NAME} · 当前提醒与番茄钟", 0x40)
+        elif cmd == CMD_CLEAR_REMINDERS:
+            n = self.reminders.clear_all()
+            self._show_bubble(f"已取消全部 {n} 项提醒啦~", time.perf_counter(), duration=2.8)
+        elif cmd == CMD_TOGGLE_SCENE_AWARE:
+            self.config["scene_awareness_enabled"] = not self.config.get("scene_awareness_enabled", True)
+            self._save_config()
+        elif cmd == CMD_OUTFIT_BEAR:
             self._toggle_outfit("bear")
         elif cmd == CMD_OUTFIT_DAILY:
             self._toggle_outfit("daily")
         elif cmd == CMD_OUTFIT_SUMMER:
             self._toggle_outfit("summer")
+        elif cmd == CMD_OUTFIT_HOODIE:
+            self._toggle_outfit("hoodie")
+        elif cmd == CMD_OUTFIT_PUFFER:
+            self._toggle_outfit("puffer")
         elif cmd == CMD_TOGGLE_OUTFIT:
             self._toggle_outfit()
+        elif cmd == CMD_TOGGLE_WEATHER:
+            en = not self.config.get("weather_auto_outfit", True)
+            self.config["weather_auto_outfit"] = en
+            self._save_config()
+            if en:
+                self.life_engine.request_weather_refresh(
+                    str(self.config.get("weather_city", "")),
+                    available_packs=self.packs.keys(),
+                    auto_outfit=True,
+                    night_bear_mode=bool(self.config.get("night_bear_mode", True)),
+                    force_outfit=True,
+                    announce=True,
+                )
+        elif cmd == CMD_TOGGLE_NIGHT_BEAR:
+            self.config["night_bear_mode"] = not self.config.get("night_bear_mode", True)
+            self._save_config()
+        elif cmd == CMD_SET_CITY:
+            cur_city = str(self.config.get("weather_city", ""))
+            ok, new_city = show_city_input_dialog(self.hwnd or 0, cur_city, dpi=self._dpi_factor())
+            if ok:
+                self.config["weather_city"] = new_city
+                self._save_config()
+                self._show_bubble(
+                    f"收到！正在查「{new_city}」的天气~" if new_city else "收到！正在自动定位查天气~",
+                    time.perf_counter(),
+                    duration=2.5,
+                )
+                self.life_engine.request_weather_refresh(
+                    new_city,
+                    available_packs=self.packs.keys(),
+                    auto_outfit=bool(self.config.get("weather_auto_outfit", True)),
+                    night_bear_mode=bool(self.config.get("night_bear_mode", True)),
+                    force_outfit=True,
+                    announce=True,
+                )
+        elif cmd == CMD_REFRESH_WEATHER:
+            self._show_bubble("马上帮你查最新天气~", time.perf_counter(), duration=2.2)
+            self.life_engine.request_weather_refresh(
+                str(self.config.get("weather_city", "")),
+                available_packs=self.packs.keys(),
+                auto_outfit=bool(self.config.get("weather_auto_outfit", True)),
+                night_bear_mode=bool(self.config.get("night_bear_mode", True)),
+                force_outfit=True,
+                announce=True,
+            )
+        elif cmd == CMD_TOGGLE_MUSIC:
+            en = not self.config.get("music_rhythm_enabled", True)
+            self.config["music_rhythm_enabled"] = en
+            self.audio_rhythm.set_enabled(en)
+            self._save_config()
+            if en:
+                self._show_bubble("放首歌吧！我跟着节拍给你打气~", time.perf_counter(), duration=2.8)
+        elif cmd == CMD_TOGGLE_LIFE_CARE:
+            self.config["life_care_enabled"] = not self.config.get("life_care_enabled", True)
+            self._save_config()
+        elif cmd == CMD_SHOW_STATS:
+            report = self.life_engine.format_stats_report(str(self.config.get("weather_city", "")))
+            user32.MessageBoxW(self.hwnd or None, report, f"{APP_NAME} · 陪伴小档案", 0x40)
         elif cmd == CMD_SENS_CHILL:
             self.config["mood_sensitivity"] = "chill"
             self._save_config()
@@ -2012,16 +2869,22 @@ class ChibiDesktopPet:
             if was_dragging:
                 self.land_pop_until = now + 0.18
                 self._save_config()
-            elif was_down and self._interactions_enabled():
-                # Stationary click: check if it landed on her soft cheeks -> defer 230ms so double-click can cancel it!
+            elif was_down:
                 lx, ly = self._down_local
-                sx, sy, sw, sh = self._sprite_rect
-                if sw > 10 and sh > 10:
-                    rx = (lx - sx) / float(sw)
-                    ry = (ly - sy) / float(sh)
-                    if (0.24 <= rx <= 0.76) and (0.35 <= ry <= 0.63):
-                        self._pending_poke_at = now + 0.23
-                        self._pending_poke_pos = (lx, ly)
+                bx1, by1, bx2, by2 = self._bubble_rect
+                if (bx2 > bx1) and (bx1 <= lx <= bx2) and (by1 <= ly <= by2):
+                    # Clicking her active speech bubble pops open the quick chat bar!
+                    self._pending_poke_at = 0.0
+                    self._open_chat_bar()
+                elif self._interactions_enabled():
+                    # Stationary click: check if it landed on her soft cheeks -> defer 230ms so double-click can cancel it!
+                    sx, sy, sw, sh = self._sprite_rect
+                    if sw > 10 and sh > 10:
+                        rx = (lx - sx) / float(sw)
+                        ry = (ly - sy) / float(sh)
+                        if (0.24 <= rx <= 0.76) and (0.35 <= ry <= 0.63):
+                            self._pending_poke_at = now + 0.23
+                            self._pending_poke_pos = (lx, ly)
             return 0
 
         if msg == WM_LBUTTONDBLCLK:
@@ -2031,6 +2894,10 @@ class ChibiDesktopPet:
 
         if msg == WM_RBUTTONUP:
             self._show_context_menu()
+            return 0
+
+        if msg == WM_MBUTTONUP:
+            self._open_chat_bar()
             return 0
 
         if msg == WM_MOUSEWHEEL:
@@ -2050,14 +2917,34 @@ class ChibiDesktopPet:
                     self._toggle_outfit()
             return 0
 
+        if msg == WM_HOTKEY:
+            if wParam == HOTKEY_ID_CHAT:
+                self._toggle_chat_bar()
+            elif wParam == HOTKEY_ID_CLIPBOARD:
+                self._run_clipboard_assist()
+            return 0
+
         if msg == WM_CLOSE:
             user32.DestroyWindow(hwnd)
             return 0
 
         if msg == WM_DESTROY:
             user32.KillTimer(hwnd, 1)
+            if self._hotkey_registered:
+                user32.UnregisterHotKey(hwnd, HOTKEY_ID_CHAT)
+                self._hotkey_registered = False
+            if self._clip_hotkey_registered:
+                user32.UnregisterHotKey(hwnd, HOTKEY_ID_CLIPBOARD)
+                self._clip_hotkey_registered = False
+            if self.chat_bar:
+                self.chat_bar.destroy()
+            if self.detail_card:
+                self.detail_card.destroy()
+            self.settings_server.stop()
             self._remove_tray_icon()
             self.input_monitor.stop()
+            self.audio_rhythm.stop()
+            self.life_engine.stats.save(force=True)
             self._save_config()
             user32.PostQuitMessage(0)
             return 0
@@ -2102,7 +2989,27 @@ class ChibiDesktopPet:
     def run(self) -> None:
         self._create_window()
         self._add_tray_icon()
+        if user32.RegisterHotKey(self.hwnd, HOTKEY_ID_CHAT, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_K):
+            self._hotkey_registered = True
+            self._chat_hotkey_label = "Ctrl+Shift+K"
+        elif user32.RegisterHotKey(self.hwnd, HOTKEY_ID_CHAT, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_K):
+            self._hotkey_registered = True
+            self._chat_hotkey_label = "Alt+Shift+K"
+        else:
+            self._hotkey_registered = False
+            self._chat_hotkey_label = "右键菜单"
+
+        if user32.RegisterHotKey(self.hwnd, HOTKEY_ID_CLIPBOARD, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_T):
+            self._clip_hotkey_registered = True
+            self._clip_hotkey_label = "Ctrl+Shift+T"
+        elif user32.RegisterHotKey(self.hwnd, HOTKEY_ID_CLIPBOARD, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, VK_T):
+            self._clip_hotkey_registered = True
+            self._clip_hotkey_label = "Alt+Shift+T"
+        else:
+            self._clip_hotkey_registered = False
+            self._clip_hotkey_label = "右键菜单"
         self.input_monitor.start()
+        self.audio_rhythm.start()
 
         self._blit_layered(self._render_frame(time.perf_counter()))
         user32.SetTimer(self.hwnd, 1, 16, None)
@@ -2230,6 +3137,80 @@ class ChibiDesktopPet:
             }),
         ])
 
+        if "hoodie" in self.packs:
+            scenarios.append(("12_hoodie_typing", "hoodie", {
+                "expr": "happy", "mouse_pose": "ul", "kb_pose": "high",
+                "glow_keys": {"S": 0.95, "D": 0.7},
+                "pills": [("Ctrl", 0.30), ("S", 0.14), ("D", 0.03)],
+                "mouse_click_alpha": 0.85, "kps": 4.8, "hit_age": 0.05,
+            }))
+        if "puffer" in self.packs:
+            scenarios.append(("13_puffer_frantic", "puffer", {
+                "expr": "frantic", "mouse_pose": "ur", "kb_pose": "low",
+                "glow_keys": {"Shift": 1.0, "1": 0.85, "Space": 0.65},
+                "pills": [("Shift", 0.28), ("1", 0.12), ("Space", 0.03)],
+                "mouse_click_alpha": 0.0, "kps": 11.8, "hit_age": 0.04,
+            }))
+
+        # Phase 1 visual scenarios: WASAPI music rhythm notes + wrapped weather auto-outfit buddy bubble
+        if "hoodie" in self.packs:
+            scenarios.append(("14_phase1_music_rhythm_hoodie", "hoodie", {
+                "expr": "happy", "mouse_pose": "center", "kb_pose": "mid",
+                "mood_label": "music", "show_hud": True,
+                "music": {"dancing": True, "energy": 0.85, "sway_x": 4.2 * dpi, "bob_y": -3.2 * dpi, "squash": 0.018},
+                "bubble": ("这首歌节奏好带感呀搭子~", 0.45, 3.2),
+                "particles": [
+                    {"kind": "note", "x": w_est * 0.24, "y": top_y + 52 * dpi, "vx": -12 * dpi, "vy": -30 * dpi,
+                     "static_age": 0.40, "life": 1.55, "size": 13.0 * dpi, "color": (255, 118, 162), "phase": 0.4, "text": "double"},
+                    {"kind": "note", "x": w_est * 0.76, "y": top_y + 42 * dpi, "vx": 12 * dpi, "vy": -28 * dpi,
+                     "static_age": 0.55, "life": 1.55, "size": 12.0 * dpi, "color": (104, 188, 255), "phase": 1.7, "text": "single"},
+                    {"kind": "note", "x": w_est * 0.70, "y": top_y + 28 * dpi, "vx": 9 * dpi, "vy": -26 * dpi,
+                     "static_age": 0.25, "life": 1.55, "size": 11.5 * dpi, "color": (255, 194, 72), "phase": 2.6, "text": "double"},
+                ],
+            }))
+        if "puffer" in self.packs:
+            scenarios.append(("15_phase1_weather_care_puffer", "puffer", {
+                "expr": "happy", "mouse_pose": "dr", "kb_pose": "up",
+                "bubble": ("杭州 9°C 阴天 · 外面好冷呀，先套上奶白羽绒服保暖！", 0.45, 4.2),
+                "particles": [
+                    {"kind": "sparkle", "x": w_est * 0.25, "y": top_y + 58 * dpi, "vx": -18 * dpi, "vy": -22 * dpi,
+                     "static_age": 0.38, "life": 1.15, "size": 10.5 * dpi, "color": (126, 206, 255), "phase": 0.3, "text": ""},
+                    {"kind": "sparkle", "x": w_est * 0.75, "y": top_y + 54 * dpi, "vx": 18 * dpi, "vy": -20 * dpi,
+                     "static_age": 0.34, "life": 1.15, "size": 10.0 * dpi, "color": (255, 204, 78), "phase": 1.6, "text": ""},
+                ],
+            }))
+        scenarios.append(("16_phase2_ai_chat_reply_bear", "bear", {
+            "expr": "happy", "mouse_pose": "center", "kb_pose": "up",
+            "bubble": ("哈哈收到搭子！这局我负责摇旗呐喊，C位交给你啦~", 0.45, 4.5),
+            "particles": [
+                {"kind": "sparkle", "x": w_est * 0.28, "y": top_y + 44 * dpi, "vx": -14 * dpi, "vy": -26 * dpi,
+                 "static_age": 0.36, "life": 1.1, "size": 10.0 * dpi, "color": (255, 204, 78), "phase": 0.4, "text": ""},
+                {"kind": "sparkle", "x": w_est * 0.72, "y": top_y + 40 * dpi, "vx": 14 * dpi, "vy": -24 * dpi,
+                 "static_age": 0.30, "life": 1.1, "size": 9.5 * dpi, "color": (255, 134, 168), "phase": 1.8, "text": ""},
+            ],
+        }))
+        if "daily" in self.packs:
+            scenarios.append(("17_phase3_clipboard_helper_daily", "daily", {
+                "expr": "focused", "mouse_pose": "center", "kb_pose": "high",
+                "glow_keys": {"S": 0.85, "D": 0.72},
+                "bubble": ("剪贴板翻译好啦！完整版放小纸条里可一键复制~", 0.45, 4.5),
+                "particles": [
+                    {"kind": "sparkle", "x": w_est * 0.27, "y": top_y + 48 * dpi, "vx": -12 * dpi, "vy": -24 * dpi,
+                     "static_age": 0.35, "life": 1.1, "size": 10.0 * dpi, "color": (104, 194, 255), "phase": 0.5, "text": ""},
+                ],
+            }))
+        if "summer" in self.packs:
+            scenarios.append(("18_phase3_pomodoro_done_summer", "summer", {
+                "expr": "happy", "mouse_pose": "center", "kb_pose": "up",
+                "bubble": ("25分钟番茄钟完成！厉害呀，起来喝口水歇会~", 0.45, 5.0),
+                "particles": [
+                    {"kind": "heart", "x": w_est * 0.28, "y": top_y + 42 * dpi, "vx": -10 * dpi, "vy": -32 * dpi,
+                     "static_age": 0.40, "life": 1.4, "size": 11.0 * dpi, "color": (255, 118, 152), "phase": 0.4, "text": ""},
+                    {"kind": "sparkle", "x": w_est * 0.74, "y": top_y + 38 * dpi, "vx": 14 * dpi, "vy": -26 * dpi,
+                     "static_age": 0.32, "life": 1.1, "size": 10.5 * dpi, "color": (255, 204, 78), "phase": 1.7, "text": ""},
+                ],
+            }))
+
         msg = wt.MSG()
         for name, outfit, ov in scenarios:
             if outfit in self.packs:
@@ -2277,8 +3258,12 @@ def resolve_runtime_roots() -> Tuple[Path, Path]:
     """Return (resource_root, writable_data_root) for both source and PyInstaller frozen EXE."""
     if getattr(sys, "frozen", False):
         res_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
-        data_root = Path(sys.executable).resolve().parent
-        return res_root, data_root
+        exe_dir = Path(sys.executable).resolve().parent
+        # When running locally out of <repo>/dist/开开陪玩.exe, share data with <repo> so
+        # .lnk/.exe and source launch always see the exact same ai_config.json & memory.json!
+        if exe_dir.name.lower() == "dist" and (exe_dir.parent / "src" / "desktop_pet.py").exists():
+            return res_root, exe_dir.parent
+        return res_root, exe_dir
     src_root = Path(__file__).resolve().parent.parent
     return src_root, src_root
 

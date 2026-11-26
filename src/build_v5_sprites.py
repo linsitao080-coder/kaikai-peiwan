@@ -39,10 +39,11 @@ FACE_ELLIPSE_REL = (0.305, 0.285, 0.735, 0.595)
 
 LEFT_MOUSE_POLY_REL = [
     (0.220, 0.610),
-    (0.455, 0.610),
-    (0.482, 0.765),
-    (0.456, 0.845),
-    (0.412, 0.912),
+    (0.478, 0.610),
+    (0.505, 0.755),
+    (0.506, 0.798),
+    (0.484, 0.835),
+    (0.418, 0.912),
     (0.205, 0.905),
     (0.202, 0.815),
     (0.180, 0.775),
@@ -54,9 +55,11 @@ RIGHT_KB_POLY_REL = [
     (0.605, 0.585),
     (0.845, 0.585),
     (0.865, 0.955),
-    (0.392, 0.928),
-    (0.474, 0.755),
-    (0.545, 0.725),
+    (0.430, 0.928),
+    (0.495, 0.838),
+    (0.514, 0.798),
+    (0.516, 0.745),
+    (0.545, 0.720),
 ]
 
 # Keycap polygons/boxes in relative [0..1] raw 1024x1024 coordinates (verified on bear_grid.png)
@@ -115,6 +118,26 @@ OUTFIT_THEMES = {
         "pill_border_rgba": [146, 112, 186, 238],
         "pill_text_rgba": [86, 54, 118, 255],
         "pill_accent_rgba": [196, 152, 246, 255],
+    },
+    "hoodie": {
+        "name": "灰色卫衣斜挎包款",
+        "key_glow_rgba": [255, 146, 184, 144],
+        "key_glow_frantic_rgba": [255, 96, 128, 158],
+        "mouse_click_rgba": [255, 146, 184, 168],
+        "pill_bg_rgba": [255, 246, 250, 238],
+        "pill_border_rgba": [154, 124, 142, 238],
+        "pill_text_rgba": [82, 56, 72, 255],
+        "pill_accent_rgba": [248, 162, 194, 255],
+    },
+    "puffer": {
+        "name": "奶白羽绒服冬日款",
+        "key_glow_rgba": [126, 206, 255, 142],
+        "key_glow_frantic_rgba": [255, 114, 138, 156],
+        "mouse_click_rgba": [126, 206, 255, 168],
+        "pill_bg_rgba": [246, 251, 255, 238],
+        "pill_border_rgba": [112, 152, 192, 238],
+        "pill_text_rgba": [48, 76, 108, 255],
+        "pill_accent_rgba": [142, 204, 248, 255],
     },
 }
 
@@ -406,6 +429,6 @@ def process_outfit(outfit_id: str) -> None:
 
 if __name__ == "__main__":
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    targets = sys.argv[1:] if len(sys.argv) > 1 else ["bear", "daily", "summer"]
+    targets = sys.argv[1:] if len(sys.argv) > 1 else ["bear", "daily", "summer", "hoodie", "puffer"]
     for oid in targets:
         process_outfit(oid)

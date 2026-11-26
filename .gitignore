@@ -16,6 +16,11 @@ src/install_skins_to_bongocat.py
 
 # Local runtime state & logs
 config.json
+stats.json
+ai_config.json
+memory.json
+reminders.json
+chat_history.json
 error.log
 
 # Python & PyInstaller build artifacts
